@@ -71,6 +71,22 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
     }
 }
 
+#[cfg(feature = "merkle_debug_print")]
+fn log_merkle_tree_size(num_leaves: usize) {
+    log::info!("Constructing new Merkle tree with {} elements", num_leaves);
+}
+
+#[cfg(not(feature = "merkle_debug_print"))]
+fn log_merkle_tree_size(_: usize) {}
+
+#[cfg(feature = "merkle_debug_print")]
+fn log_merkle_tree_done() {
+    log::info!("--> construction done!");
+}
+
+#[cfg(not(feature = "merkle_debug_print"))]
+fn log_merkle_tree_done() {}
+
 fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUninit<T>] {
     assert!(v.capacity() >= len);
     let v_ptr = v.as_mut_ptr().cast::<MaybeUninit<T>>();
@@ -150,6 +166,8 @@ fn fill_digests_buf<F: RichField, H: Hasher<F>>(
 
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+        log_merkle_tree_size(leaves.len());
+
         let log2_leaves_len = log2_strict(leaves.len());
         assert!(
             cap_height <= log2_leaves_len,
@@ -174,6 +192,8 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             digests.set_len(num_digests);
             cap.set_len(len_cap);
         }
+
+        log_merkle_tree_done();
 
         Self {
             leaves,
