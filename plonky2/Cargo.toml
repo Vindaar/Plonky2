@@ -19,6 +19,15 @@ parallel = ["hashbrown/rayon", "plonky2_maybe_rayon/parallel"]
 std = ["anyhow/std", "rand/std", "itertools/use_std"]
 timing = ["std", "dep:web-time"]
 merkle_debug_print = []
+gpu_merkle = [
+    "std",
+    "dep:wgpu",
+    "dep:bytemuck",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+    "dep:console_error_panic_hook",
+]
 
 [dependencies]
 ahash = { workspace = true }
@@ -42,7 +51,13 @@ plonky2_util = { version = "0.2.0", path = "../util", default-features = false }
 
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+bytemuck = { version = "1.18", features = ["derive"], optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
 getrandom = { version = "0.2", default-features = false, features = ["js"] }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["console"], optional = true }
+wgpu = { version = "0.20", default-features = false, features = ["webgpu"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", default-features = false }

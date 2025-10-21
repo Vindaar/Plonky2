@@ -10,6 +10,8 @@ use crate::hash::hash_types::RichField;
 use crate::hash::merkle_proofs::MerkleProof;
 use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+use super::merkle_tree_gpu;
 
 /// The Merkle cap of height `h` of a Merkle tree is the `h`-th layer (from the root) of the tree.
 /// It can be used in place of the root to verify Merkle paths, which are `h` elements shorter.
@@ -175,6 +177,27 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             cap_height,
             log2_leaves_len
         );
+
+        #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+        if let Some(result) =
+            merkle_tree_gpu::try_build_merkle_tree::<F, H>(&leaves, cap_height)
+        {
+            match result {
+                Ok(output) => {
+                    log_merkle_tree_done();
+                    return Self {
+                        leaves,
+                        digests: output.digests,
+                        cap: MerkleCap(output.cap),
+                    };
+                }
+                Err(err) => {
+                    web_sys::console::warn_1(
+                        &format!("Merkle GPU path failed; falling back to CPU: {err}").into(),
+                    );
+                }
+            }
+        }
 
         let num_digests = 2 * (leaves.len() - (1 << cap_height));
         let mut digests = Vec::with_capacity(num_digests);
