@@ -1072,7 +1072,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     ) -> (CircuitData<F, C, D>, bool) {
         let mut timing = TimingTree::new("preprocess", Level::Trace);
 
-        #[cfg(feature = "std")]
+        #[cfg(all(feature = "std", not(target_family = "wasm")))]
         let start = Instant::now();
 
         // Execute all hooks
@@ -1314,7 +1314,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         };
 
         timing.print();
-        #[cfg(feature = "std")]
+        #[cfg(all(feature = "std", not(target_family = "wasm")))]
         debug!("Building circuit took {}s", start.elapsed().as_secs_f32());
         (
             CircuitData {

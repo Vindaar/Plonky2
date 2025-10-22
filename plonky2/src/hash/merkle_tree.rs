@@ -1,17 +1,23 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+use core::any::TypeId;
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+use core::mem;
 use core::mem::MaybeUninit;
 use core::slice;
 
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+use super::merkle_tree_gpu;
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+use crate::hash::hash_types::HashOut;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_proofs::MerkleProof;
 use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
-#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
-use super::merkle_tree_gpu;
 
 /// The Merkle cap of height `h` of a Merkle tree is the `h`-th layer (from the root) of the tree.
 /// It can be used in place of the root to verify Merkle paths, which are `h` elements shorter.
@@ -88,6 +94,14 @@ fn log_merkle_tree_done() {
 
 #[cfg(not(feature = "merkle_debug_print"))]
 fn log_merkle_tree_done() {}
+
+#[cfg(feature = "merkle_debug_print")]
+fn log_merkle_tree_done_gpu() {
+    log::info!("--> construction done one GPU!");
+}
+
+#[cfg(not(feature = "merkle_debug_print"))]
+fn log_merkle_tree_done_gpu() {}
 
 fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUninit<T>] {
     assert!(v.capacity() >= len);
@@ -179,22 +193,28 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         );
 
         #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
-        if let Some(result) =
-            merkle_tree_gpu::try_build_merkle_tree::<F, H>(&leaves, cap_height)
-        {
-            match result {
-                Ok(output) => {
-                    log_merkle_tree_done();
-                    return Self {
-                        leaves,
-                        digests: output.digests,
-                        cap: MerkleCap(output.cap),
-                    };
-                }
-                Err(err) => {
-                    web_sys::console::warn_1(
-                        &format!("Merkle GPU path failed; falling back to CPU: {err}").into(),
-                    );
+        if true {
+            // TypeId::of::<H::Hash>() == TypeId::of::<HashOut<F>>() {
+            if let Some(result) = merkle_tree_gpu::try_build_merkle_tree::<F>(&leaves, cap_height) {
+                match result {
+                    Ok(output) => {
+                        log_merkle_tree_done_gpu();
+                        let merkle_tree_gpu::GpuMerkleOutput { digests, cap } = output;
+                        let digests: Vec<H::Hash> =
+                            unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(digests) };
+                        let cap_vec: Vec<H::Hash> =
+                            unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(cap) };
+                        return Self {
+                            leaves,
+                            digests,
+                            cap: MerkleCap(cap_vec),
+                        };
+                    }
+                    Err(err) => {
+                        web_sys::console::warn_1(
+                            &format!("Merkle GPU path failed; falling back to CPU: {err}").into(),
+                        );
+                    }
                 }
             }
         }
