@@ -22,3 +22,6 @@ pub mod util;
 
 #[cfg(test)]
 mod lookup_test;
+
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+pub mod wasm_test;

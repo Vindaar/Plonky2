@@ -247,6 +247,11 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                     );
                 }
             }
+        } else {
+            web_sys::console::warn_1(
+                &format!("WebGPU context not initialized. Falling back to CPU construction!")
+                    .into(),
+            );
         }
 
         Self::build_cpu(leaves, cap_height)
