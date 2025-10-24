@@ -300,7 +300,7 @@ fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
                 binding: 3,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: NonZeroU64::new(
                         std::mem::size_of::<MerkleTreeKernelArgs>() as u64
@@ -755,7 +755,7 @@ where
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("merkle-layer-args-{layer}")),
                 contents: bytemuck::bytes_of(&args),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             });
 
         let bind_group = ctx_ref
