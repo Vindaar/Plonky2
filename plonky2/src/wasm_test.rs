@@ -138,10 +138,13 @@ pub async fn test_merkle_tree_construction() -> Result<JsValue, JsValue> {
 
     web_sys::console::log_1(&"Calling MerkleTree::new_async()...".into());
 
+    console::time_with_label("Merkle tree construction");
     // Construct the Merkle tree using the async (GPU) path
     let tree =
         MerkleTree::<GoldilocksField, PoseidonHash>::new_async(padded_leaves, cap_height).await;
+    //MerkleTree::<GoldilocksField, PoseidonHash>::new(padded_leaves, cap_height);
 
+    console::time_end_with_label("Merkle tree construction");
     web_sys::console::log_1(&"Merkle tree construction complete!".into());
 
     // Get the root hash
