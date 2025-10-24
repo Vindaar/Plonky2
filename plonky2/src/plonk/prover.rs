@@ -35,6 +35,9 @@ use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_pr
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
 
+#[cfg(all(feature = "std", not(all(feature = "gpu_merkle", target_arch = "wasm32"))))]
+use futures::executor::block_on;
+
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
 /// the last gate to appear is the first LUT gate.
@@ -109,7 +112,11 @@ pub fn set_lookup_wires<
     }
 }
 
-pub fn prove<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+pub async fn prove_async<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
     inputs: PartialWitness<F>,
@@ -125,17 +132,60 @@ where
         generate_partial_witness(inputs, prover_data, common_data)
     );
 
-    prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
+    prove_with_partition_witness_async(prover_data, common_data, partition_witness, timing).await
 }
 
-pub fn prove_with_partition_witness<
+#[cfg(not(all(feature = "gpu_merkle", target_arch = "wasm32")))]
+pub fn prove<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
-    mut partition_witness: PartitionWitness<F>,
+    inputs: PartialWitness<F>,
+    timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    #[cfg(feature = "std")]
+    {
+        return block_on(prove_async(prover_data, common_data, inputs, timing));
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        panic!("plonk::prover::prove requires the `std` feature when async proving is enabled");
+    }
+}
+
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+pub fn prove<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    _prover_data: &ProverOnlyCircuitData<F, C, D>,
+    _common_data: &CommonCircuitData<F, D>,
+    _inputs: PartialWitness<F>,
+    _timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    panic!("plonk::prover::prove must be awaited on wasm with gpu_merkle enabled; use prove_async instead");
+}
+
+pub async fn prove_with_partition_witness_async<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    mut partition_witness: PartitionWitness<'_, F>,
     timing: &mut TimingTree,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
@@ -172,7 +222,7 @@ where
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_values(
+        PolynomialBatch::<F, C, D>::from_values_async(
             wires_values,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
@@ -180,6 +230,7 @@ where
             timing,
             prover_data.fft_root_table.as_ref(),
         )
+        .await
     );
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
@@ -287,7 +338,7 @@ where
     let quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs(
+        PolynomialBatch::<F, C, D>::from_coeffs_async(
             all_quotient_poly_chunks,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
@@ -295,6 +346,7 @@ where
             timing,
             prover_data.fft_root_table.as_ref(),
         )
+        .await
     );
 
     challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
@@ -328,7 +380,7 @@ where
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
+        PolynomialBatch::<F, C, D>::prove_openings_async(
             &instance,
             &[
                 &prover_data.constants_sigmas_commitment,
@@ -340,6 +392,7 @@ where
             &common_data.fri_params,
             timing,
         )
+        .await
     );
 
     let proof = Proof::<F, C, D> {
@@ -353,6 +406,58 @@ where
         proof,
         public_inputs,
     })
+}
+
+#[cfg(not(all(feature = "gpu_merkle", target_arch = "wasm32")))]
+pub fn prove_with_partition_witness<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    partition_witness: PartitionWitness<'_, F>,
+    timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    #[cfg(feature = "std")]
+    {
+        block_on(prove_with_partition_witness_async(
+            prover_data,
+            common_data,
+            partition_witness,
+            timing,
+        ))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        panic!(
+            "plonk::prover::prove_with_partition_witness requires the `std` feature when async proving is enabled"
+        );
+    }
+}
+
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+pub fn prove_with_partition_witness<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    _prover_data: &ProverOnlyCircuitData<F, C, D>,
+    _common_data: &CommonCircuitData<F, D>,
+    _partition_witness: PartitionWitness<'_, F>,
+    _timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    panic!(
+        "plonk::prover::prove_with_partition_witness must be awaited on wasm with gpu_merkle enabled"
+    );
 }
 
 /// Compute the partial products used in the `Z` polynomials.

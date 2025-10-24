@@ -17,8 +17,11 @@ use crate::timed;
 use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
 
-/// Builds a FRI proof.
-pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+#[cfg(all(feature = "std", not(all(feature = "gpu_merkle", target_arch = "wasm32"))))]
+use futures::executor::block_on;
+
+/// Builds a FRI proof asynchronously.
+pub async fn fri_proof_async<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
     // Coefficients of the polynomial on which the LDT is performed. Only the first `1/rate` coefficients are non-zero.
     lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
@@ -35,12 +38,13 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     let (trees, final_coeffs) = timed!(
         timing,
         "fold codewords in the commitment phase",
-        fri_committed_trees::<F, C, D>(
+        fri_committed_trees_async::<F, C, D>(
             lde_polynomial_coeffs,
             lde_polynomial_values,
             challenger,
             fri_params,
         )
+        .await
     );
 
     // PoW phase
@@ -62,12 +66,56 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     }
 }
 
+/// Builds a FRI proof synchronously (blocking).
+#[cfg(not(all(feature = "gpu_merkle", target_arch = "wasm32")))]
+pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    lde_polynomial_values: PolynomialValues<F::Extension>,
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    timing: &mut TimingTree,
+) -> FriProof<F, C::Hasher, D> {
+    #[cfg(feature = "std")]
+    {
+        return block_on(fri_proof_async::<F, C, D>(
+            initial_merkle_trees,
+            lde_polynomial_coeffs,
+            lde_polynomial_values,
+            challenger,
+            fri_params,
+            timing,
+        ));
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        panic!("fri_proof requires the `std` feature when async proving is enabled");
+    }
+}
+
+/// `fri_proof` must not be called directly on wasm when GPU Merkle is enabled.
+#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    _initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    _lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    _lde_polynomial_values: PolynomialValues<F::Extension>,
+    _challenger: &mut Challenger<F, C::Hasher>,
+    _fri_params: &FriParams,
+    _timing: &mut TimingTree,
+) -> FriProof<F, C::Hasher, D> {
+    panic!("fri_proof must be awaited on wasm with gpu_merkle enabled; call fri_proof_async instead");
+}
+
 type FriCommitedTrees<F, C, const D: usize> = (
     Vec<MerkleTree<F, <C as GenericConfig<D>>::Hasher>>,
     PolynomialCoeffs<<F as Extendable<D>>::Extension>,
 );
 
-fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+async fn fri_committed_trees_async<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
     challenger: &mut Challenger<F, C::Hasher>,
@@ -85,7 +133,11 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
             .par_chunks(arity)
             .map(|chunk: &[F::Extension]| flatten(chunk))
             .collect();
-        let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
+        let tree = MerkleTree::<F, C::Hasher>::new_async(
+            chunked_values,
+            fri_params.config.cap_height,
+        )
+        .await;
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);

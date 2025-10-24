@@ -8,10 +8,14 @@
 
 #![cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
 
-use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 
+use futures::{
+    channel::oneshot,
+    future::{poll_fn, FutureExt},
+};
 use anyhow::{anyhow, ensure, Result};
 use bytemuck::{Pod, Zeroable};
 use once_cell::unsync::OnceCell;
@@ -421,6 +425,154 @@ struct MerkleBuffers {
     cap: Buffer,
 }
 
+enum MerkleGpuJobState<F: RichField> {
+    Immediate(GpuMerkleOutput<F>),
+    Deferred {
+        context: Rc<MerkleTreeGpuContext>,
+        buffers: MerkleBuffers,
+        leaf_hashes: Vec<HashOut<F>>,
+        total_nodes: usize,
+        cap_len: usize,
+        num_leaves: usize,
+        cap_height: usize,
+        num_layers_to_cap: usize,
+    },
+}
+
+pub struct MerkleGpuJob<F: RichField> {
+    state: MerkleGpuJobState<F>,
+    _marker: PhantomData<F>,
+}
+
+impl<F> MerkleGpuJob<F>
+where
+    F: RichField + Poseidon + 'static,
+{
+    fn immediate(output: GpuMerkleOutput<F>) -> Self {
+        Self {
+            state: MerkleGpuJobState::Immediate(output),
+            _marker: PhantomData,
+        }
+    }
+
+    fn deferred(
+        context: Rc<MerkleTreeGpuContext>,
+        buffers: MerkleBuffers,
+        leaf_hashes: Vec<HashOut<F>>,
+        total_nodes: usize,
+        cap_len: usize,
+        num_leaves: usize,
+        cap_height: usize,
+        num_layers_to_cap: usize,
+    ) -> Self {
+        Self {
+            state: MerkleGpuJobState::Deferred {
+                context,
+                buffers,
+                leaf_hashes,
+                total_nodes,
+                cap_len,
+                num_leaves,
+                cap_height,
+                num_layers_to_cap,
+            },
+            _marker: PhantomData,
+        }
+    }
+
+    async fn finish(self) -> Result<GpuMerkleOutput<F>> {
+        match self.state {
+            MerkleGpuJobState::Immediate(output) => Ok(output),
+            MerkleGpuJobState::Deferred {
+                context,
+                buffers,
+                leaf_hashes,
+                total_nodes,
+                cap_len,
+                num_leaves,
+                cap_height,
+                num_layers_to_cap,
+            } => {
+                wait_for_queue(context.queue.clone()).await?;
+
+                let node_hashes: Vec<HashOut<F>> = if total_nodes > 0 {
+                    let node_words = read_u32_buffer_async(
+                        context.device.clone(),
+                        context.queue.clone(),
+                        &buffers.nodes,
+                        total_nodes * WORDS_PER_DIGEST,
+                    )
+                    .await?;
+                    node_words
+                        .chunks(WORDS_PER_DIGEST)
+                        .map(montgomery_words_to_hash::<F>)
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
+
+                let cap_words = read_u32_buffer_async(
+                    context.device.clone(),
+                    context.queue.clone(),
+                    &buffers.cap,
+                    cap_len * WORDS_PER_DIGEST,
+                )
+                .await?;
+                let cap_hashes: Vec<HashOut<F>> = cap_words
+                    .chunks(WORDS_PER_DIGEST)
+                    .map(montgomery_words_to_hash::<F>)
+                    .collect::<Result<Vec<_>>>()?;
+
+                let num_digests = 2 * (num_leaves - (1 << cap_height));
+                let mut digests = if num_digests == 0 {
+                    Vec::new()
+                } else {
+                    vec![HashOut::default(); num_digests]
+                };
+
+                if num_digests > 0 {
+                    let accessor = LayerAccessor::new(
+                        &leaf_hashes,
+                        &node_hashes,
+                        &cap_hashes,
+                        num_leaves,
+                        num_layers_to_cap,
+                    );
+                    let subtree_digests_len = num_digests >> cap_height;
+                    let subtree_leaves_len = num_leaves >> cap_height;
+
+                    log("Subtree business");
+                    for (subtree_idx, subtree_buf) in digests.chunks_mut(subtree_digests_len).enumerate() {
+                        let leaf_offset = subtree_idx * subtree_leaves_len;
+                        let root_digest = fill_subtree_from_gpu(
+                            subtree_buf,
+                            &accessor,
+                            leaf_offset,
+                            subtree_leaves_len,
+                        );
+                        debug_assert_eq!(root_digest, cap_hashes[subtree_idx]);
+                    }
+                }
+
+                Ok(GpuMerkleOutput {
+                    digests,
+                    cap: cap_hashes,
+                })
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn await_async(self) -> Result<GpuMerkleOutput<F>> {
+        self.finish().await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn wait(self) -> Result<GpuMerkleOutput<F>> {
+        pollster::block_on(self.finish())
+    }
+}
+
 fn create_buffers(
     ctx: &MerkleTreeGpuContext,
     leaf_count: usize,
@@ -459,9 +611,20 @@ fn write_words(queue: &Queue, buffer: &Buffer, data: &[u32]) {
     queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
 }
 
-fn read_u32_buffer(
-    device: &Device,
-    queue: &Queue,
+async fn wait_for_queue(queue: Rc<Queue>) -> Result<()> {
+    let (sender, receiver) = oneshot::channel();
+    queue.on_submitted_work_done(move || {
+        let _ = sender.send(());
+    });
+    receiver
+        .await
+        .map_err(|_| anyhow!("queue completion receiver dropped"))?;
+    Ok(())
+}
+
+async fn read_u32_buffer_async(
+    device: Rc<Device>,
+    queue: Rc<Queue>,
     buffer: &Buffer,
     word_len: usize,
 ) -> Result<Vec<u32>> {
@@ -480,21 +643,21 @@ fn read_u32_buffer(
     queue.submit(Some(encoder.finish()));
 
     let slice = staging.slice(..);
-    let map_result = Rc::new(RefCell::new(None));
-    let map_clone = Rc::clone(&map_result);
+    let (map_sender, map_receiver) = oneshot::channel();
     slice.map_async(wgpu::MapMode::Read, move |res| {
-        *map_clone.borrow_mut() = Some(res);
+        let _ = map_sender.send(res);
     });
 
-    while map_result.borrow().is_none() {
-        device.poll(wgpu::PollType::Wait);
-    }
-
-    map_result
-        .borrow_mut()
-        .take()
-        .expect("map_async result missing")
-        .map_err(|err| anyhow!("failed to map buffer: {err}"))?;
+    // Drive the device to make progress while we wait for the map to complete.
+    let mut map_receiver = map_receiver.fuse();
+    poll_fn(move |cx| {
+        device.poll(wgpu::Maintain::Poll);
+        map_receiver.poll_unpin(cx)
+    })
+    .await
+    .map_err(|_| anyhow!("failed to receive map result"))?
+    .map_err(|err| anyhow!("failed to map buffer: {err}"))?;
+    log::info!("Result received.");
 
     let data = slice.get_mapped_range();
     let words = bytemuck::cast_slice(&data).to_vec();
@@ -504,15 +667,16 @@ fn read_u32_buffer(
     Ok(words)
 }
 
-/// Run the GPU Merkle tree pipeline.
+/// Run the GPU Merkle tree pipeline, returning a job that resolves once GPU buffers are ready.
 pub fn build_merkle_tree<F>(
-    ctx: &MerkleTreeGpuContext,
+    ctx: Rc<MerkleTreeGpuContext>,
     leaves: &[Vec<F>],
     cap_height: usize,
-) -> Result<GpuMerkleOutput<F>>
+) -> Result<MerkleGpuJob<F>>
 where
     F: RichField + Poseidon,
 {
+    let ctx_ref = ctx.as_ref();
     let num_leaves = leaves.len();
     ensure!(num_leaves > 0, "Merkle tree requires at least one leaf");
     ensure!(
@@ -534,10 +698,10 @@ where
     log("...done cpu hashing");
 
     if cap_height == depth {
-        return Ok(GpuMerkleOutput {
+        return Ok(MerkleGpuJob::immediate(GpuMerkleOutput {
             digests: Vec::new(),
             cap: leaf_hashes,
-        });
+        }));
     }
 
     let num_layers_to_root = depth;
@@ -554,8 +718,8 @@ where
     }
 
     log("writing words");
-    let buffers = create_buffers(ctx, num_leaves, total_nodes, cap_len);
-    write_words(&ctx.queue, &buffers.input, &flattened_leaves);
+    let buffers = create_buffers(ctx_ref, num_leaves, total_nodes, cap_len);
+    write_words(&ctx_ref.queue, &buffers.input, &flattened_leaves);
 
     for layer in 0..num_layers_to_cap {
         log(&format!("layer: {}", layer));
@@ -583,7 +747,7 @@ where
             write_to_cap: write_to_cap as u32,
         };
 
-        let args_buffer = ctx
+        let args_buffer = ctx_ref
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("merkle-layer-args-{layer}")),
@@ -591,46 +755,48 @@ where
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(&format!("merkle-layer-bind-group-{layer}")),
-            layout: &ctx.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffers.input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: buffers.nodes.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: buffers.cap.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: args_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: ctx.mds_circ.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: ctx.mds_diag.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: ctx.round_constants.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = ctx_ref
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("merkle-layer-bind-group-{layer}")),
+                layout: &ctx_ref.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffers.input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buffers.nodes.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffers.cap.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: args_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: ctx_ref.mds_circ.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: ctx_ref.mds_diag.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: ctx_ref.round_constants.as_entire_binding(),
+                    },
+                ],
+            });
 
         let threads_per_block = WORKGROUP_SIZE as usize;
         let num_blocks = (dst_layer_size + threads_per_block - 1) / threads_per_block;
         let workgroups_x = num_blocks.max(1) as u32;
 
-        let mut encoder = ctx
+        let mut encoder = ctx_ref
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some(&format!("merkle-layer-{layer}-encoder")),
@@ -642,75 +808,27 @@ where
                 label: Some(&format!("merkle-layer-{layer}-pass")),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&ctx.pipeline);
+            pass.set_pipeline(&ctx_ref.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups_x, 1, 1);
         }
 
-        ctx.queue.submit(Some(encoder.finish()));
-        ctx.queue.on_submitted_work_done(|| {});
-        ctx.device.poll(wgpu::PollType::Wait);
+        ctx_ref.queue.submit(Some(encoder.finish()));
+        ctx_ref.queue.on_submitted_work_done(|| {});
     }
 
-    log("reading back nodes");
-    let node_hashes: Vec<HashOut<F>> = if total_nodes > 0 {
-        let node_words = read_u32_buffer(
-            &ctx.device,
-            &ctx.queue,
-            &buffers.nodes,
-            total_nodes * WORDS_PER_DIGEST,
-        )?;
-        node_words
-            .chunks(WORDS_PER_DIGEST)
-            .map(montgomery_words_to_hash::<F>)
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
-    log("reading back cap");
+    log("queued GPU Merkle buffers");
 
-    let cap_words = read_u32_buffer(
-        &ctx.device,
-        &ctx.queue,
-        &buffers.cap,
-        cap_len * WORDS_PER_DIGEST,
-    )?;
-    let cap_hashes: Vec<HashOut<F>> = cap_words
-        .chunks(WORDS_PER_DIGEST)
-        .map(montgomery_words_to_hash::<F>)
-        .collect::<Result<Vec<_>>>()?;
-
-    let num_digests = 2 * (num_leaves - (1 << cap_height));
-    let mut digests = if num_digests == 0 {
-        Vec::new()
-    } else {
-        vec![HashOut::default(); num_digests]
-    };
-
-    if num_digests > 0 {
-        let accessor = LayerAccessor::new(
-            &leaf_hashes,
-            &node_hashes,
-            &cap_hashes,
-            num_leaves,
-            num_layers_to_cap,
-        );
-        let subtree_digests_len = num_digests >> cap_height;
-        let subtree_leaves_len = num_leaves >> cap_height;
-
-        log("Subtree business");
-        for (subtree_idx, subtree_buf) in digests.chunks_mut(subtree_digests_len).enumerate() {
-            let leaf_offset = subtree_idx * subtree_leaves_len;
-            let root_digest =
-                fill_subtree_from_gpu(subtree_buf, &accessor, leaf_offset, subtree_leaves_len);
-            debug_assert_eq!(root_digest, cap_hashes[subtree_idx]);
-        }
-    }
-
-    Ok(GpuMerkleOutput {
-        digests,
-        cap: cap_hashes,
-    })
+    Ok(MerkleGpuJob::deferred(
+        ctx,
+        buffers,
+        leaf_hashes,
+        total_nodes,
+        cap_len,
+        num_leaves,
+        cap_height,
+        num_layers_to_cap,
+    ))
 }
 
 fn fill_subtree_from_gpu<F: RichField>(
@@ -791,7 +909,7 @@ impl<'a, F: RichField> LayerAccessor<'a, F> {
 pub fn try_build_merkle_tree<F>(
     leaves: &[Vec<F>],
     cap_height: usize,
-) -> Option<Result<GpuMerkleOutput<F>>>
+) -> Option<Result<MerkleGpuJob<F>>>
 where
     F: RichField + Poseidon,
 {
@@ -801,7 +919,7 @@ where
         None => return None,
     };
 
-    Some(build_merkle_tree::<F>(&context, leaves, cap_height))
+    Some(build_merkle_tree::<F>(context, leaves, cap_height))
 }
 
 /// GPU Merkle output that mirrors the CPU layout.

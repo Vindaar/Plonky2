@@ -1,8 +1,6 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
-use core::any::TypeId;
-#[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
 use core::mem;
 use core::mem::MaybeUninit;
 use core::slice;
@@ -181,7 +179,7 @@ fn fill_digests_buf<F: RichField, H: Hasher<F>>(
 }
 
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
-    pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+    fn build_cpu(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
         log_merkle_tree_size(leaves.len());
 
         let log2_leaves_len = log2_strict(leaves.len());
@@ -191,33 +189,6 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             cap_height,
             log2_leaves_len
         );
-
-        #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
-        if true {
-            // TypeId::of::<H::Hash>() == TypeId::of::<HashOut<F>>() {
-            if let Some(result) = merkle_tree_gpu::try_build_merkle_tree::<F>(&leaves, cap_height) {
-                match result {
-                    Ok(output) => {
-                        log_merkle_tree_done_gpu();
-                        let merkle_tree_gpu::GpuMerkleOutput { digests, cap } = output;
-                        let digests: Vec<H::Hash> =
-                            unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(digests) };
-                        let cap_vec: Vec<H::Hash> =
-                            unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(cap) };
-                        return Self {
-                            leaves,
-                            digests,
-                            cap: MerkleCap(cap_vec),
-                        };
-                    }
-                    Err(err) => {
-                        web_sys::console::warn_1(
-                            &format!("Merkle GPU path failed; falling back to CPU: {err}").into(),
-                        );
-                    }
-                }
-            }
-        }
 
         let num_digests = 2 * (leaves.len() - (1 << cap_height));
         let mut digests = Vec::with_capacity(num_digests);
@@ -243,6 +214,71 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             digests,
             cap: MerkleCap(cap),
         }
+    }
+
+    pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+        Self::build_cpu(leaves, cap_height)
+    }
+
+    #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+    async fn build_gpu(
+        leaves: Vec<Vec<F>>,
+        cap_height: usize,
+    ) -> Self {
+        if let Some(result) = merkle_tree_gpu::try_build_merkle_tree::<F>(&leaves, cap_height) {
+            match result {
+                Ok(job) => match job.await_async().await {
+                    Ok(output) => {
+                        log_merkle_tree_done_gpu();
+                        return Self::from_gpu_output(leaves, output);
+                    }
+                    Err(err) => {
+                        web_sys::console::warn_1(
+                            &format!(
+                                "Merkle GPU job failed; falling back to CPU construction: {err}"
+                            )
+                            .into(),
+                        );
+                    }
+                },
+                Err(err) => {
+                    web_sys::console::warn_1(
+                        &format!("Merkle GPU path unavailable; falling back to CPU: {err}").into(),
+                    );
+                }
+            }
+        }
+
+        Self::build_cpu(leaves, cap_height)
+    }
+
+    #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+    fn from_gpu_output(
+        leaves: Vec<Vec<F>>,
+        output: merkle_tree_gpu::GpuMerkleOutput<F>,
+    ) -> Self {
+        let merkle_tree_gpu::GpuMerkleOutput { digests, cap } = output;
+        // SAFETY: HashOut<F> and H::Hash share the same layout when H::Hash = HashOut<F>.
+        let digests: Vec<H::Hash> =
+            unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(digests) };
+        let cap_vec: Vec<H::Hash> =
+            unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(cap) };
+
+        Self {
+            leaves,
+            digests,
+            cap: MerkleCap(cap_vec),
+        }
+    }
+
+    #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+    pub async fn new_async(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+        Self::build_gpu(leaves, cap_height).await
+    }
+
+    #[cfg(not(all(feature = "gpu_merkle", target_arch = "wasm32")))]
+    pub async fn new_async(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+        Self::build_cpu(leaves, cap_height)
     }
 
     pub fn get(&self, i: usize) -> &[F] {
