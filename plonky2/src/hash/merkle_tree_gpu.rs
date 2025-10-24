@@ -670,6 +670,27 @@ async fn read_u32_buffer_async(
     Ok(words)
 }
 
+fn transpose_leaves(leaves: Vec<Vec<F>>) -> (Vec<F>, usize) {
+    let num_leaves = leaves.len();
+    let elements_per_leaf = leaves[0].len();
+
+    // Verify uniform length
+    assert!(
+        leaves.iter().all(|v| v.len() == elements_per_leaf),
+        "All leaf vectors must have the same length"
+    );
+
+    // Now transpose knowing all are elements_per_leaf long
+    let mut transposed = Vec::with_capacity(num_leaves * elements_per_leaf);
+    for elem_idx in 0..elements_per_leaf {
+        for leaf in &leaves {
+            transposed.push(leaf[elem_idx]);
+        }
+    }
+
+    (transposed, elements_per_leaf)
+}
+
 /// Run the GPU Merkle tree pipeline, returning a job that resolves once GPU buffers are ready.
 pub fn build_merkle_tree<F>(
     ctx: Rc<MerkleTreeGpuContext>,
