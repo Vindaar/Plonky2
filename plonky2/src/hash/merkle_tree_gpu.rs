@@ -12,12 +12,10 @@ use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 
-use futures::{
-    channel::oneshot,
-    future::{poll_fn, FutureExt},
-};
 use anyhow::{anyhow, ensure, Result};
 use bytemuck::{Pod, Zeroable};
+use futures::channel::oneshot;
+use futures::future::{poll_fn, FutureExt};
 use once_cell::unsync::OnceCell;
 use plonky2_maybe_rayon::{MaybeParIter, ParallelIterator};
 use web_sys::console;
@@ -419,12 +417,14 @@ fn host_layer_offset(input_size: usize, layer: usize) -> usize {
     offset
 }
 
+#[derive(Debug)]
 struct MerkleBuffers {
     input: Buffer,
     nodes: Buffer,
     cap: Buffer,
 }
 
+#[derive(Debug)]
 enum MerkleGpuJobState<F: RichField> {
     Immediate(GpuMerkleOutput<F>),
     Deferred {
@@ -439,6 +439,7 @@ enum MerkleGpuJobState<F: RichField> {
     },
 }
 
+#[derive(Debug)]
 pub struct MerkleGpuJob<F: RichField> {
     state: MerkleGpuJobState<F>,
     _marker: PhantomData<F>,
@@ -542,7 +543,9 @@ where
                     let subtree_leaves_len = num_leaves >> cap_height;
 
                     log("Subtree business");
-                    for (subtree_idx, subtree_buf) in digests.chunks_mut(subtree_digests_len).enumerate() {
+                    for (subtree_idx, subtree_buf) in
+                        digests.chunks_mut(subtree_digests_len).enumerate()
+                    {
                         let leaf_offset = subtree_idx * subtree_leaves_len;
                         let root_digest = fill_subtree_from_gpu(
                             subtree_buf,
@@ -651,7 +654,7 @@ async fn read_u32_buffer_async(
     // Drive the device to make progress while we wait for the map to complete.
     let mut map_receiver = map_receiver.fuse();
     poll_fn(move |cx| {
-        device.poll(wgpu::Maintain::Poll);
+        device.poll(wgpu::PollType::Poll);
         map_receiver.poll_unpin(cx)
     })
     .await

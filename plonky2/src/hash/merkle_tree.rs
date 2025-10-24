@@ -79,15 +79,29 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
 
 #[cfg(feature = "merkle_debug_print")]
 fn log_merkle_tree_size(num_leaves: usize) {
-    log::info!("Constructing new Merkle tree with {} elements", num_leaves);
+    log::info!(
+        "Constructing new Merkle tree on CPU with {} elements",
+        num_leaves
+    );
 }
 
 #[cfg(not(feature = "merkle_debug_print"))]
 fn log_merkle_tree_size(_: usize) {}
 
 #[cfg(feature = "merkle_debug_print")]
+fn log_merkle_tree_size_gpu(num_leaves: usize) {
+    log::info!(
+        "Constructing new Merkle tree on GPU with {} elements",
+        num_leaves
+    );
+}
+
+#[cfg(not(feature = "merkle_debug_print"))]
+fn log_merkle_tree_size_gpu(_: usize) {}
+
+#[cfg(feature = "merkle_debug_print")]
 fn log_merkle_tree_done() {
-    log::info!("--> construction done!");
+    log::info!("--> construction on CPU done!");
 }
 
 #[cfg(not(feature = "merkle_debug_print"))]
@@ -95,7 +109,7 @@ fn log_merkle_tree_done() {}
 
 #[cfg(feature = "merkle_debug_print")]
 fn log_merkle_tree_done_gpu() {
-    log::info!("--> construction done one GPU!");
+    log::info!("--> construction on GPU done!");
 }
 
 #[cfg(not(feature = "merkle_debug_print"))]
@@ -221,10 +235,8 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     }
 
     #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
-    async fn build_gpu(
-        leaves: Vec<Vec<F>>,
-        cap_height: usize,
-    ) -> Self {
+    async fn build_gpu(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
+        log_merkle_tree_size_gpu(leaves.len());
         if let Some(result) = merkle_tree_gpu::try_build_merkle_tree::<F>(&leaves, cap_height) {
             match result {
                 Ok(job) => match job.await_async().await {
@@ -258,16 +270,12 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     }
 
     #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
-    fn from_gpu_output(
-        leaves: Vec<Vec<F>>,
-        output: merkle_tree_gpu::GpuMerkleOutput<F>,
-    ) -> Self {
+    fn from_gpu_output(leaves: Vec<Vec<F>>, output: merkle_tree_gpu::GpuMerkleOutput<F>) -> Self {
         let merkle_tree_gpu::GpuMerkleOutput { digests, cap } = output;
         // SAFETY: HashOut<F> and H::Hash share the same layout when H::Hash = HashOut<F>.
         let digests: Vec<H::Hash> =
             unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(digests) };
-        let cap_vec: Vec<H::Hash> =
-            unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(cap) };
+        let cap_vec: Vec<H::Hash> = unsafe { mem::transmute::<Vec<HashOut<F>>, Vec<H::Hash>>(cap) };
 
         Self {
             leaves,
