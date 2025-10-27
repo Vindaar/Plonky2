@@ -254,12 +254,16 @@ pub async fn initialize() -> Result<()> {
 
     log("Requesting device");
 
+    let mut limits = wgpu::Limits::default();
+    limits.max_buffer_size = (1 << 32) - 5;
+    limits.max_storage_buffer_binding_size = (1 << 32) - 5;
+
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("Merkle Tree Device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: limits,
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,
             },
