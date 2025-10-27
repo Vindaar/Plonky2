@@ -137,13 +137,12 @@ fn field_to_words<F: RichField>(value: &F) -> [u32; BIGINT_LIMBS] {
     [(canon & 0xFFFF_FFFF) as u32, (canon >> 32) as u32]
 }
 
-fn montgomery_words_to_field<F: RichField>(words: &[u32; BIGINT_LIMBS]) -> F {
-    let monty = (words[1] as u64) << 32 | (words[0] as u64);
-    let canonical = from_montgomery_u64(monty);
-    F::from_canonical_u64(canonical)
+fn words_to_field<F: RichField>(words: &[u32; BIGINT_LIMBS]) -> F {
+    let canon = (words[1] as u64) << 32 | (words[0] as u64);
+    F::from_canonical_u64(canon)
 }
 
-fn montgomery_words_to_hash<F: RichField>(words: &[u32]) -> Result<HashOut<F>> {
+fn words_to_hash<F: RichField>(words: &[u32]) -> Result<HashOut<F>> {
     ensure!(
         words.len() == WORDS_PER_DIGEST,
         "expected {} words per digest, got {}",
@@ -153,7 +152,7 @@ fn montgomery_words_to_hash<F: RichField>(words: &[u32]) -> Result<HashOut<F>> {
     let mut elements = [F::ZERO; NUM_HASH_OUT_ELTS];
     for (i, chunk) in words.chunks(BIGINT_LIMBS).enumerate() {
         let chunk: [u32; BIGINT_LIMBS] = chunk.try_into().unwrap();
-        elements[i] = montgomery_words_to_field(&chunk);
+        elements[i] = words_to_field(&chunk);
     }
     Ok(HashOut { elements })
 }
@@ -829,9 +828,9 @@ where
                 let leaf_convert_start = now_ms();
                 let leaf_hashes: Vec<HashOut<F>> = leaf_words
                     .chunks(WORDS_PER_DIGEST)
-                    .map(montgomery_words_to_hash::<F>)
+                    .map(words_to_hash::<F>)
                     .collect::<Result<Vec<_>>>()?;
-                log_timing("Leaf Montgomery conversion", now_ms() - leaf_convert_start);
+                log_timing("Leaf canonical decode", now_ms() - leaf_convert_start);
 
                 // Read node hashes
                 let node_read_start = now_ms();
@@ -848,9 +847,9 @@ where
                     let convert_start = now_ms();
                     let result = node_words
                         .chunks(WORDS_PER_DIGEST)
-                        .map(montgomery_words_to_hash::<F>)
+                        .map(words_to_hash::<F>)
                         .collect::<Result<Vec<_>>>()?;
-                    log_timing("Node Montgomery conversion", now_ms() - convert_start);
+                    log_timing("Node canonical decode", now_ms() - convert_start);
                     result
                 } else {
                     Vec::new()
@@ -870,9 +869,9 @@ where
                 let cap_convert_start = now_ms();
                 let cap_hashes: Vec<HashOut<F>> = cap_words
                     .chunks(WORDS_PER_DIGEST)
-                    .map(montgomery_words_to_hash::<F>)
+                    .map(words_to_hash::<F>)
                     .collect::<Result<Vec<_>>>()?;
-                log_timing("Cap Montgomery conversion", now_ms() - cap_convert_start);
+                log_timing("Cap canonical decode", now_ms() - cap_convert_start);
 
                 // CPU post-processing: reconstruct digest tree
                 console::log_1(&"=== PHASE 5: CPU Post-processing ===".into());
@@ -1239,6 +1238,70 @@ where
     input_buffer
 }
 
+/// Converts the input buffer from Montgomery representation into canonical representation
+/// to put it back into the form Plonky2 expects.
+/// `num` is the number of field elements in the buffer.
+fn montgomery_to_canonical_gpu(ctx: &MerkleTreeGpuContext, buf: &Buffer, num: u32) {
+    // Time data conversion
+    let convert_start = now_ms();
+
+    // Time buffer creation
+    let buffer_start = now_ms();
+
+    let num_i32 = num as i32;
+    let num_buffer = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("buf-elems-count"),
+            contents: bytemuck::bytes_of(&num_i32),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("to-montgomery-bind-group"),
+        layout: &ctx.to_canon_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: num_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    log_timing(
+        "  Mont->Canon buffer creation + bind group",
+        now_ms() - buffer_start,
+    );
+
+    // Time dispatch
+    let dispatch_start = now_ms();
+    let workgroup_size = WORKGROUP_SIZE;
+    debug_assert!(workgroup_size <= 256);
+    let workgroups_x = ((num as u32) + workgroup_size - 1) / workgroup_size;
+
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("buf-mont-canon-encoder"),
+        });
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("buf-mont-canon-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&ctx.to_canon_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(workgroups_x, 1, 1);
+    }
+
+    ctx.queue.submit(Some(encoder.finish()));
+    ctx.queue.on_submitted_work_done(|| {});
+    log_timing("  Mont->Canon dispatch", now_ms() - dispatch_start);
+}
 
 fn leaf_info<F>(leaves: &[Vec<F>]) -> (usize, usize)
 where
@@ -1458,6 +1521,18 @@ where
             .into(),
         );
     }
+
+    // Convert input buffer (leaf nodes) from Montgomery into canonical repr
+    montgomery_to_canonical_gpu(
+        ctx_ref,
+        &buffers.input,
+        (num_leaves * NUM_HASH_OUT_ELTS) as u32,
+    );
+    montgomery_to_canonical_gpu(
+        ctx_ref,
+        &buffers.nodes,
+        (total_nodes * NUM_HASH_OUT_ELTS) as u32,
+    );
 
     let total_layer_time = now_ms() - layer_setup_start;
     log_timing("Total layer setup + dispatch", total_layer_time);
