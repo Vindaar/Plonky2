@@ -37,6 +37,9 @@ const POSEIDON_WIDTH: usize = SPONGE_WIDTH;
 const ROUND_CONSTANT_COUNT: usize = POSEIDON_WIDTH * poseidon::N_ROUNDS;
 const WORKGROUP_SIZE: u32 = 64;
 
+// for `now` for timing
+use wasm_bindgen::prelude::*;
+
 thread_local! {
     /// WebGPU context reused across Merkle tree constructions.
     static GPU_CONTEXT: OnceCell<Rc<MerkleTreeGpuContext>> = OnceCell::new();
@@ -189,11 +192,20 @@ fn log(msg: &str) {
 // PROFILING HELPERS
 // ============================================================================
 
+/// We need to use the `performance` feature of WASM for profiling. Otherwise when
+/// running in a web worker
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = performance)]
+    fn now() -> f64;
+}
+
 /// Get high-resolution timestamp in milliseconds
 fn now_ms() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
-        web_sys::window().unwrap().performance().unwrap().now()
+        //web_sys::window().unwrap().performance().unwrap().now()
+        now()
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
