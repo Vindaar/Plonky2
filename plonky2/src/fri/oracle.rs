@@ -330,6 +330,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+    #[track_caller]
     pub fn prove_openings(
         _instance: &FriInstanceInfo<F, D>,
         _oracles: &[&Self],
@@ -337,6 +338,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         _fri_params: &FriParams,
         _timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
-        panic!("prove_openings must be awaited on wasm with gpu_merkle enabled");
+        let caller = core::panic::Location::caller();
+        panic!(
+            "prove_openings must be awaited on wasm with gpu_merkle enabled (caller: {}:{})",
+            caller.file(),
+            caller.line()
+        );
     }
 }
