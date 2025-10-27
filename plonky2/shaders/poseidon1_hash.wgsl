@@ -38,7 +38,8 @@ Let `N` be the total number of inputs and `k` the size of each vector.
 
 This is in contrast to the layout one would normally encounter, corresponding to
 `seq[seq[T]]` where the inner `seq[T]` is each vector to be hashed. */;
-  let tid: i32 = i32(global_id.x);
+  let grid_width: u32 = (num_workgroups.x * 64u);
+  let tid: i32 = ((i32(global_id.y) * i32(grid_width)) + i32(global_id.x));
   if ((num <= tid)) {
     return ;
   };

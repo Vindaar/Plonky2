@@ -36,7 +36,8 @@ struct MerkleTreeKernelArgs {
 fn processMerkleTreeLayerWithCap(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
   /* Process a single layer of the Merkle tree with cap support using
 the layer-based storage layout shared with the proof generator. */;
-  let tid: i32 = i32(global_id.x);
+  let grid_width: u32 = (num_workgroups.x * 64u);
+  let tid: i32 = ((i32(global_id.y) * i32(grid_width)) + i32(global_id.x));
   if ((args.dstLayerSize <= tid)) {
     return ;
   };
