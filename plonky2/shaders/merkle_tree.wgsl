@@ -11,6 +11,7 @@ const M: BigInt = BigInt(array(u32(1), u32(4294967295)));
 const MontyOne: BigInt = BigInt(array(u32(4294967295), u32(0)));
 const PP1D2: BigInt = BigInt(array(u32(2147483649), u32(2147483647)));
 const M0NInv: u32 = 4294967295;
+const R2modP: BigInt = BigInt(array(u32(1), u32(4294967294)));
 const WORKGROUP_SIZE: i32 = 64;
 
 struct BigInt {
@@ -62,7 +63,7 @@ the layer-based storage layout shared with the proof generator. */;
   if ((args.writeToCap == 1)) {
     if ((tid < args.capLen)) {
       for(var i: i32 = 0; i < 4; i++) {
-        cap[tid].elems[i] = state[i];
+        cap[tid].elems[i] = getCanonical(state[i]);
       };
     };
   } else {
@@ -452,4 +453,78 @@ fn partialRoundsNaive_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_c
     mdsLayer_lmut(state);
     (*round_ctr) = i32(((*round_ctr) + 1));
   };
+}
+
+fn getCanonical(b: BigInt) -> BigInt {
+  var canon: BigInt;
+  fromMont_CIOS_lmut_l_l_l((&canon), b, M, 4294967295);
+  return canon;
+}
+
+fn fromMont_CIOS_lmut_l_l_l(r: ptr<function, BigInt>, a: BigInt, M: BigInt, m0ninv: u32) {
+  /* Convert from Montgomery form to canonical BigInt form */;
+  var t: BigInt = a;
+
+  { // unrolledIter_i0
+  let m: u32 = (t.limbs[0] * m0ninv);
+  var C: u32;
+  var lo: u32;
+  muladd1_gpu_lmut_lmut_l_l_l((&C), (&lo), m, M.limbs[0], t.limbs[0]);
+
+  { // unrolledIter_j1
+  muladd2_gpu_lmut_lmut_l_l_l_l((&C), (&t.limbs[0]), m, M.limbs[1], C, t.limbs[1]);
+  } // unrolledIter_j1
+
+  t.limbs[1] = C;
+  } // unrolledIter_i0
+
+
+  { // unrolledIter_i1
+  let m: u32 = (t.limbs[0] * m0ninv);
+  var C: u32;
+  var lo: u32;
+  muladd1_gpu_lmut_lmut_l_l_l((&C), (&lo), m, M.limbs[0], t.limbs[0]);
+
+  { // unrolledIter_j1
+  muladd2_gpu_lmut_lmut_l_l_l_l((&C), (&t.limbs[0]), m, M.limbs[1], C, t.limbs[1]);
+  } // unrolledIter_j1
+
+  t.limbs[1] = C;
+  } // unrolledIter_i1
+
+  csub_no_mod_lmut_l_l((&t), M, !less(t, M));
+  (*r) = t;
+}
+
+fn muladd1_gpu_lmut_lmut_l_l_l(hi: ptr<function, u32>, lo: ptr<function, u32>, a: u32, b: u32, c: u32) {
+  /* Extended precision multiplication + addition
+(hi, lo) <- a*b + c
+
+Note: 0xFFFFFFFF_FFFFFFFF² -> (hi: 0xFFFFFFFFFFFFFFFE, lo: 0x0000000000000001)
+      so adding any c cannot overflow
+
+Note: `_gpu` prefix to not confuse Nim compiler with `precompute/muladd1` */;
+  (*lo) = mulloadd_co(a, b, c);
+  (*hi) = mulhiadd_ci(a, b, 0u);
+}
+
+fn mulhiadd_ci(a: u32, b: u32, c: u32) -> u32 {
+  /* Multiply-add high with carry in */;
+  let hi_product: u32 = mul_hi(a, b);
+  return add_ci(hi_product, c);
+}
+
+fn muladd2_gpu_lmut_lmut_l_l_l_l(hi: ptr<function, u32>, lo: ptr<function, u32>, a: u32, b: u32, c1: u32, c2: u32) {
+  /* Extended precision multiplication + addition + addition
+(hi, lo) <- a*b + c1 + c2
+
+Note: 0xFFFFFFFF_FFFFFFFF² -> (hi: 0xFFFFFFFFFFFFFFFE, lo: 0x0000000000000001)
+      so adding 0xFFFFFFFFFFFFFFFF leads to (hi: 0xFFFFFFFFFFFFFFFF, lo: 0x0000000000000000)
+      and we have enough space to add again 0xFFFFFFFFFFFFFFFF without overflowing
+
+Note: `_gpu` prefix to not confuse Nim compiler with `precompute/muladd2` */;
+  (*lo) = mulloadd_co(a, b, c1);
+  (*hi) = mulhiadd_ci(a, b, 0u);
+  (*lo) = add_co((*lo), c2);
+  (*hi) = add_ci((*hi), 0u);
 }

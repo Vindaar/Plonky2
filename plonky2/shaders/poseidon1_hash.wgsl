@@ -11,6 +11,7 @@ const M: BigInt = BigInt(array(u32(1), u32(4294967295)));
 const MontyOne: BigInt = BigInt(array(u32(4294967295), u32(0)));
 const PP1D2: BigInt = BigInt(array(u32(2147483649), u32(2147483647)));
 const M0NInv: u32 = 4294967295;
+const R2modP: BigInt = BigInt(array(u32(1), u32(4294967294)));
 const WORKGROUP_SIZE: i32 = 64;
 
 struct BigInt {
@@ -54,6 +55,15 @@ This is in contrast to the layout one would normally encounter, corresponding to
       let idx: i32 = ((elementIdx * num) + tid);
       state[j] = input[idx];
     };
+    poseidonPermuteMutImpl_lmut((&state));
+  };
+  let rem: i32 = (elementsPerLeaf % 8);
+  for(var j: i32 = 0; j < rem; j++) {
+    let elementIdx: i32 = ((numChunks * 8) + j);
+    let idx: i32 = ((elementIdx * num) + tid);
+    state[j] = input[idx];
+  };
+  if ((0 < rem)) {
     poseidonPermuteMutImpl_lmut((&state));
   };
 
@@ -445,3 +455,4 @@ fn partialRoundsNaive_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_c
     (*round_ctr) = i32(((*round_ctr) + 1));
   };
 }
+
