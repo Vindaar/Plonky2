@@ -153,6 +153,35 @@ fn log(msg: &str) {
     }
 }
 
+// ============================================================================
+// PROFILING HELPERS
+// ============================================================================
+
+/// Get high-resolution timestamp in milliseconds
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window().unwrap().performance().unwrap().now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // For native, use a simple placeholder
+        0.0
+    }
+}
+
+/// Log timing information to console
+fn log_timing(label: &str, duration_ms: f64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        console::log_1(&format!("⏱️  {}: {:.2}ms", label, duration_ms).into());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        println!("⏱️  {}: {:.2}ms", label, duration_ms);
+    }
+}
+
 /// Initialize the global WebGPU context. Subsequent calls are no-ops.
 pub async fn initialize() -> Result<()> {
     if GPU_CONTEXT.with(|cell| cell.get().is_some()) {
@@ -269,14 +298,16 @@ fn create_leaf_hash_pipeline(
         push_constant_ranges: &[],
     });
 
-    Ok(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("Poseidon Leaf Hash Pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &shader_module,
-        entry_point: Some("poseidon1Hash"),
-        compilation_options: Default::default(),
-        cache: None,
-    }))
+    Ok(
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Poseidon Leaf Hash Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("poseidon1Hash"),
+            compilation_options: Default::default(),
+            cache: None,
+        }),
+    )
 }
 
 /// Returns `true` when the WebGPU context is ready for use.
@@ -607,8 +638,16 @@ where
                 cap_height,
                 num_layers_to_cap,
             } => {
-                wait_for_queue(context.queue.clone()).await?;
+                console::log_1(&"=== PHASE 4: GPU Completion & Readback ===".into());
+                let readback_start = now_ms();
 
+                // Wait for GPU to finish
+                let wait_start = now_ms();
+                wait_for_queue(context.queue.clone()).await?;
+                log_timing("⚡ GPU execution (wait_for_queue)", now_ms() - wait_start);
+
+                // Read leaf hashes
+                let leaf_read_start = now_ms();
                 let leaf_words = read_u32_buffer_async(
                     context.device.clone(),
                     context.queue.clone(),
@@ -616,11 +655,17 @@ where
                     num_leaves * WORDS_PER_DIGEST,
                 )
                 .await?;
+                log_timing("Leaf hash readback", now_ms() - leaf_read_start);
+
+                let leaf_convert_start = now_ms();
                 let leaf_hashes: Vec<HashOut<F>> = leaf_words
                     .chunks(WORDS_PER_DIGEST)
                     .map(montgomery_words_to_hash::<F>)
                     .collect::<Result<Vec<_>>>()?;
+                log_timing("Leaf Montgomery conversion", now_ms() - leaf_convert_start);
 
+                // Read node hashes
+                let node_read_start = now_ms();
                 let node_hashes: Vec<HashOut<F>> = if total_nodes > 0 {
                     let node_words = read_u32_buffer_async(
                         context.device.clone(),
@@ -629,14 +674,21 @@ where
                         total_nodes * WORDS_PER_DIGEST,
                     )
                     .await?;
-                    node_words
+                    log_timing("Node hash readback", now_ms() - node_read_start);
+
+                    let convert_start = now_ms();
+                    let result = node_words
                         .chunks(WORDS_PER_DIGEST)
                         .map(montgomery_words_to_hash::<F>)
-                        .collect::<Result<Vec<_>>>()?
+                        .collect::<Result<Vec<_>>>()?;
+                    log_timing("Node Montgomery conversion", now_ms() - convert_start);
+                    result
                 } else {
                     Vec::new()
                 };
 
+                // Read cap
+                let cap_read_start = now_ms();
                 let cap_words = read_u32_buffer_async(
                     context.device.clone(),
                     context.queue.clone(),
@@ -644,10 +696,18 @@ where
                     cap_len * WORDS_PER_DIGEST,
                 )
                 .await?;
+                log_timing("Cap readback", now_ms() - cap_read_start);
+
+                let cap_convert_start = now_ms();
                 let cap_hashes: Vec<HashOut<F>> = cap_words
                     .chunks(WORDS_PER_DIGEST)
                     .map(montgomery_words_to_hash::<F>)
                     .collect::<Result<Vec<_>>>()?;
+                log_timing("Cap Montgomery conversion", now_ms() - cap_convert_start);
+
+                // CPU post-processing: reconstruct digest tree
+                console::log_1(&"=== PHASE 5: CPU Post-processing ===".into());
+                let postprocess_start = now_ms();
 
                 let num_digests = 2 * (num_leaves - (1 << cap_height));
                 let mut digests = if num_digests == 0 {
@@ -682,6 +742,12 @@ where
                     }
                 }
 
+                log_timing("Digest tree reconstruction", now_ms() - postprocess_start);
+                log_timing(
+                    "📥 TOTAL READBACK + POST-PROCESSING",
+                    now_ms() - readback_start,
+                );
+
                 Ok(GpuMerkleOutput {
                     digests,
                     cap: cap_hashes,
@@ -692,7 +758,10 @@ where
 
     #[cfg(target_arch = "wasm32")]
     pub async fn await_async(self) -> Result<GpuMerkleOutput<F>> {
-        self.finish().await
+        let start = now_ms();
+        let result = self.finish().await;
+        log_timing("🏁 TOTAL await_async TIME", now_ms() - start);
+        result
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -799,10 +868,7 @@ fn transpose_leaves<F: RichField>(leaves: &[Vec<F>]) -> (Vec<F>, usize) {
     (transposed, elements_per_leaf)
 }
 
-fn hash_leaves_gpu<F>(
-    ctx: &MerkleTreeGpuContext,
-    leaves: &[Vec<F>],
-) -> Result<Buffer>
+fn hash_leaves_gpu<F>(ctx: &MerkleTreeGpuContext, leaves: &[Vec<F>]) -> Result<Buffer>
 where
     F: RichField + Poseidon,
 {
@@ -815,12 +881,12 @@ where
 
     let elements_per_leaf = leaves[0].len();
     ensure!(
-        leaves
-            .iter()
-            .all(|leaf| leaf.len() == elements_per_leaf),
+        leaves.iter().all(|leaf| leaf.len() == elements_per_leaf),
         "GPU Poseidon hashing requires leaves of uniform length"
     );
 
+    // Time data conversion
+    let convert_start = now_ms();
     let (transposed, elements_per_leaf) = transpose_leaves(leaves);
     ensure!(
         elements_per_leaf > 0,
@@ -830,8 +896,16 @@ where
         elements_per_leaf <= i32::MAX as usize,
         "elements_per_leaf must fit in i32, got {elements_per_leaf}"
     );
+    log_timing("  Leaf data transpose", now_ms() - convert_start);
 
     let transposed_words = fields_to_montgomery_words(&transposed);
+    log_timing(
+        "  Leaf data transpose + Montgomery conversion",
+        now_ms() - convert_start,
+    );
+
+    // Time buffer creation
+    let buffer_start = now_ms();
     let input_buffer = ctx
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -901,7 +975,13 @@ where
             },
         ],
     });
+    log_timing(
+        "  Leaf buffer creation + bind group",
+        now_ms() - buffer_start,
+    );
 
+    // Time dispatch
+    let dispatch_start = now_ms();
     let workgroup_size = WORKGROUP_SIZE;
     debug_assert!(workgroup_size <= 256);
     let workgroups_x = ((num_leaves as u32) + workgroup_size - 1) / workgroup_size;
@@ -924,6 +1004,7 @@ where
 
     ctx.queue.submit(Some(encoder.finish()));
     ctx.queue.on_submitted_work_done(|| {});
+    log_timing("  Leaf dispatch", now_ms() - dispatch_start);
 
     Ok(output_buffer)
 }
@@ -937,6 +1018,8 @@ pub fn build_merkle_tree<F>(
 where
     F: RichField + Poseidon,
 {
+    let total_start = now_ms();
+
     let ctx_ref = ctx.as_ref();
     let num_leaves = leaves.len();
     ensure!(num_leaves > 0, "Merkle tree requires at least one leaf");
@@ -951,10 +1034,16 @@ where
         "cap_height {cap_height} exceeds tree depth {depth}"
     );
 
+    // PHASE 1: Leaf hashing setup and dispatch
+    console::log_1(&"=== PHASE 1: Leaf Hashing ===".into());
+    let leaf_start = now_ms();
     log("launching GPU Poseidon hashing");
     let leaf_buffer = hash_leaves_gpu(ctx_ref, leaves)?;
     log("queued GPU Poseidon hashing");
+    log_timing("Leaf hash setup + dispatch", now_ms() - leaf_start);
 
+    // PHASE 2: Buffer allocation
+    console::log_1(&"=== PHASE 2: Buffer Creation ===".into());
     let num_layers_to_root = depth;
     let num_layers_to_cap = num_layers_to_root - cap_height;
     let cap_len = 1usize << cap_height;
@@ -963,9 +1052,23 @@ where
         .map(|layer| host_layer_size(num_leaves, layer))
         .sum();
 
+    let buffer_start = now_ms();
     let buffers = create_buffers(ctx_ref, leaf_buffer, total_nodes, cap_len);
+    log_timing("Buffer allocation", now_ms() - buffer_start);
+
+    // PHASE 3: Layer processing
+    console::log_1(
+        &format!(
+            "=== PHASE 3: Layer Processing ({} layers) ===",
+            num_layers_to_cap
+        )
+        .into(),
+    );
+    let layer_setup_start = now_ms();
 
     for layer in 0..num_layers_to_cap {
+        let layer_start = now_ms();
+
         log(&format!("layer: {}", layer));
         let src_layer_size = host_layer_size(num_leaves, layer);
         let dst_layer_size = host_layer_size(num_leaves, layer + 1);
@@ -991,6 +1094,8 @@ where
             write_to_cap: write_to_cap as u32,
         };
 
+        // Time bind group creation
+        let bind_start = now_ms();
         let args_buffer = ctx_ref
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1035,11 +1140,14 @@ where
                     },
                 ],
             });
+        let bind_time = now_ms() - bind_start;
 
         let threads_per_block = WORKGROUP_SIZE as usize;
         let num_blocks = (dst_layer_size + threads_per_block - 1) / threads_per_block;
         let workgroups_x = num_blocks.max(1) as u32;
 
+        // Time encoder creation and dispatch
+        let encode_start = now_ms();
         let mut encoder = ctx_ref
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1056,12 +1164,34 @@ where
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups_x, 1, 1);
         }
+        let encode_time = now_ms() - encode_start;
 
+        // Time submission (should be fast)
+        let submit_start = now_ms();
         ctx_ref.queue.submit(Some(encoder.finish()));
         ctx_ref.queue.on_submitted_work_done(|| {});
+        let submit_time = now_ms() - submit_start;
+
+        let layer_time = now_ms() - layer_start;
+        console::log_1(
+            &format!(
+                "  Layer {}: total={:.2}ms (bind={:.2}ms, encode={:.2}ms, submit={:.2}ms)",
+                layer, layer_time, bind_time, encode_time, submit_time
+            )
+            .into(),
+        );
     }
 
+    let total_layer_time = now_ms() - layer_setup_start;
+    log_timing("Total layer setup + dispatch", total_layer_time);
+
     log("queued GPU Merkle buffers");
+
+    let total_setup_time = now_ms() - total_start;
+    log_timing(
+        "🔧 TOTAL SETUP TIME (everything before GPU wait)",
+        total_setup_time,
+    );
 
     Ok(MerkleGpuJob::deferred(
         ctx,
