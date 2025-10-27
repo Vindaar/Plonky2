@@ -32,6 +32,7 @@ const BIGINT_LIMBS: usize = 2;
 const DIGEST_ELEMENTS: usize = NUM_HASH_OUT_ELTS;
 const WORDS_PER_DIGEST: usize = DIGEST_ELEMENTS * BIGINT_LIMBS;
 const BYTES_PER_DIGEST: usize = WORDS_PER_DIGEST * std::mem::size_of::<u32>();
+const BYTES_PER_BIGINT: usize = BIGINT_LIMBS * std::mem::size_of::<u32>();
 const POSEIDON_WIDTH: usize = SPONGE_WIDTH;
 const ROUND_CONSTANT_COUNT: usize = POSEIDON_WIDTH * poseidon::N_ROUNDS;
 const WORKGROUP_SIZE: u32 = 64;
@@ -50,6 +51,12 @@ pub struct MerkleTreeGpuContext {
     pub merkle_bind_group_layout: Rc<BindGroupLayout>,
     pub leaf_pipeline: Rc<ComputePipeline>,
     pub leaf_bind_group_layout: Rc<BindGroupLayout>,
+    pub to_mont_pipeline: Rc<ComputePipeline>,
+    pub to_mont_bind_group_layout: Rc<BindGroupLayout>,
+
+    pub to_canon_pipeline: Rc<ComputePipeline>,
+    pub to_canon_bind_group_layout: Rc<BindGroupLayout>,
+
     pub mds_circ: Buffer,
     pub mds_diag: Buffer,
     pub round_constants: Buffer,
@@ -63,6 +70,12 @@ impl MerkleTreeGpuContext {
         merkle_bind_group_layout: BindGroupLayout,
         leaf_pipeline: ComputePipeline,
         leaf_bind_group_layout: BindGroupLayout,
+        to_mont_pipeline: ComputePipeline,
+        to_mont_bind_group_layout: BindGroupLayout,
+
+        to_canon_pipeline: ComputePipeline,
+        to_canon_bind_group_layout: BindGroupLayout,
+
         mds_circ: Buffer,
         mds_diag: Buffer,
         round_constants: Buffer,
@@ -74,6 +87,10 @@ impl MerkleTreeGpuContext {
             merkle_bind_group_layout: Rc::new(merkle_bind_group_layout),
             leaf_pipeline: Rc::new(leaf_pipeline),
             leaf_bind_group_layout: Rc::new(leaf_bind_group_layout),
+            to_mont_pipeline: Rc::new(to_mont_pipeline),
+            to_mont_bind_group_layout: Rc::new(to_mont_bind_group_layout),
+            to_canon_pipeline: Rc::new(to_canon_pipeline),
+            to_canon_bind_group_layout: Rc::new(to_canon_bind_group_layout),
             mds_circ,
             mds_diag,
             round_constants,
@@ -112,6 +129,11 @@ fn field_to_montgomery_words<F: RichField>(value: &F) -> [u32; BIGINT_LIMBS] {
     [(monty & 0xFFFF_FFFF) as u32, (monty >> 32) as u32]
 }
 
+fn field_to_words<F: RichField>(value: &F) -> [u32; BIGINT_LIMBS] {
+    let canon = value.to_canonical_u64();
+    [(canon & 0xFFFF_FFFF) as u32, (canon >> 32) as u32]
+}
+
 fn montgomery_words_to_field<F: RichField>(words: &[u32; BIGINT_LIMBS]) -> F {
     let monty = (words[1] as u64) << 32 | (words[0] as u64);
     let canonical = from_montgomery_u64(monty);
@@ -137,6 +159,16 @@ fn fields_to_montgomery_words<F: RichField>(values: &[F]) -> Vec<u32> {
     let mut out = Vec::with_capacity(values.len() * BIGINT_LIMBS);
     for value in values {
         out.extend_from_slice(&field_to_montgomery_words(value));
+    }
+    out
+}
+
+/// Turns a Vec<F> into a Vec<u32> of all the words in all field elements
+/// So that we can directly copy to GPU buffer
+fn fields_to_words<F: RichField>(values: &[F]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(values.len() * BIGINT_LIMBS);
+    for value in values {
+        out.extend_from_slice(&field_to_words(value));
     }
     out
 }
@@ -230,6 +262,11 @@ pub async fn initialize() -> Result<()> {
     let merkle_pipeline = create_merkle_pipeline(&device, &merkle_bind_group_layout)?;
     let leaf_bind_group_layout = create_leaf_hash_bind_group_layout(&device);
     let leaf_pipeline = create_leaf_hash_pipeline(&device, &leaf_bind_group_layout)?;
+    let to_mont_bind_group_layout = create_to_mont_bind_group_layout(&device);
+    let to_mont_pipeline = create_to_mont_pipeline(&device, &to_mont_bind_group_layout)?;
+    let to_canon_bind_group_layout = create_to_canon_bind_group_layout(&device);
+    let to_canon_pipeline = create_to_canon_pipeline(&device, &to_canon_bind_group_layout)?;
+
     let (mds_circ, mds_diag, round_constants) = create_poseidon_constant_buffers::<
         crate::field::goldilocks_field::GoldilocksField,
     >(&device);
@@ -243,6 +280,10 @@ pub async fn initialize() -> Result<()> {
         merkle_bind_group_layout,
         leaf_pipeline,
         leaf_bind_group_layout,
+        to_mont_pipeline,
+        to_mont_bind_group_layout,
+        to_canon_pipeline,
+        to_canon_bind_group_layout,
         mds_circ,
         mds_diag,
         round_constants,
@@ -304,6 +345,58 @@ fn create_leaf_hash_pipeline(
             layout: Some(&pipeline_layout),
             module: &shader_module,
             entry_point: Some("poseidon1Hash"),
+            compilation_options: Default::default(),
+            cache: None,
+        }),
+    )
+}
+
+fn create_to_mont_pipeline(
+    device: &Device,
+    bind_group_layout: &BindGroupLayout,
+) -> Result<ComputePipeline> {
+    let shader_module = device.create_shader_module(wgpu::include_wgsl!(
+        "../../shaders/buffer_canonical_to_montgomery.wgsl"
+    ));
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Buffer Canonical to Montgomery Pipeline Layout"),
+        bind_group_layouts: &[bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    Ok(
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Buffer Canonical to Montgomery Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("bufferToMontgomery"),
+            compilation_options: Default::default(),
+            cache: None,
+        }),
+    )
+}
+
+fn create_to_canon_pipeline(
+    device: &Device,
+    bind_group_layout: &BindGroupLayout,
+) -> Result<ComputePipeline> {
+    let shader_module = device.create_shader_module(wgpu::include_wgsl!(
+        "../../shaders/buffer_montgomery_to_canonical.wgsl"
+    ));
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Buffer Montgomery to Canonical Pipeline Layout"),
+        bind_group_layouts: &[bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    Ok(
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Buffer Montgomery to Canonical Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("bufferToCanonical"),
             compilation_options: Default::default(),
             cache: None,
         }),
@@ -492,6 +585,66 @@ fn create_leaf_hash_bind_group_layout(device: &Device) -> BindGroupLayout {
                     min_binding_size: NonZeroU64::new(
                         (ROUND_CONSTANT_COUNT * BIGINT_LIMBS * std::mem::size_of::<u32>()) as u64,
                     ),
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_to_mont_bind_group_layout(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Buffer Canonical to Montgomery Bind Group Layout"),
+        entries: &[
+            // 0: input & output buffer to convert
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(BYTES_PER_BIGINT as u64),
+                },
+                count: None,
+            },
+            // 1: number of elements in the buffer
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<i32>() as u64),
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_to_canon_bind_group_layout(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Buffer Montgomery to Canonical Bind Group Layout"),
+        entries: &[
+            // 0: input & output buffer to convert
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(BYTES_PER_BIGINT as u64),
+                },
+                count: None,
+            },
+            // 1: number of elements in the buffer
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<i32>() as u64),
                 },
                 count: None,
             },
@@ -868,51 +1021,14 @@ fn transpose_leaves<F: RichField>(leaves: &[Vec<F>]) -> (Vec<F>, usize) {
     (transposed, elements_per_leaf)
 }
 
-fn hash_leaves_gpu<F>(ctx: &MerkleTreeGpuContext, leaves: &[Vec<F>]) -> Result<Buffer>
-where
-    F: RichField + Poseidon,
-{
-    let num_leaves = leaves.len();
-    ensure!(num_leaves > 0, "Merkle tree requires at least one leaf");
-    ensure!(
-        num_leaves <= i32::MAX as usize,
-        "Merkle GPU hashing expects leaf count to fit in i32, got {num_leaves}"
-    );
-
-    let elements_per_leaf = leaves[0].len();
-    ensure!(
-        leaves.iter().all(|leaf| leaf.len() == elements_per_leaf),
-        "GPU Poseidon hashing requires leaves of uniform length"
-    );
-
-    // Time data conversion
-    let convert_start = now_ms();
-    let (transposed, elements_per_leaf) = transpose_leaves(leaves);
-    ensure!(
-        elements_per_leaf > 0,
-        "GPU Poseidon hashing received empty leaves"
-    );
-    ensure!(
-        elements_per_leaf <= i32::MAX as usize,
-        "elements_per_leaf must fit in i32, got {elements_per_leaf}"
-    );
-    log_timing("  Leaf data transpose", now_ms() - convert_start);
-
-    let transposed_words = fields_to_montgomery_words(&transposed);
-    log_timing(
-        "  Leaf data transpose + Montgomery conversion",
-        now_ms() - convert_start,
-    );
-
+fn hash_leaves_gpu(
+    ctx: &MerkleTreeGpuContext,
+    leaf_buf: Buffer,
+    num_leaves: usize,
+    elements_per_leaf: usize,
+) -> Result<Buffer> {
     // Time buffer creation
     let buffer_start = now_ms();
-    let input_buffer = ctx
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("poseidon-leaf-input"),
-            contents: bytemuck::cast_slice(&transposed_words),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
 
     let output_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("poseidon-leaf-output"),
@@ -951,7 +1067,7 @@ where
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: input_buffer.as_entire_binding(),
+                resource: leaf_buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -1009,6 +1125,115 @@ where
     Ok(output_buffer)
 }
 
+/// Converts the input buffer from canonical representation into Montgomery representation for
+/// faster further processing on the GPU.
+/// `num` is the number of field elements in the buffer.
+fn canonical_to_montgomery_gpu<F>(
+    ctx: &MerkleTreeGpuContext,
+    transposed: &Vec<F>,
+    num: usize,
+) -> Buffer
+where
+    F: RichField + Poseidon,
+{
+    // Time data conversion
+    let convert_start = now_ms();
+
+    let input_buffer = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("poseidon-leaf-input"),
+            contents: bytemuck::cast_slice(&fields_to_words(&transposed)),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+    // Time buffer creation
+    let buffer_start = now_ms();
+
+    let num_i32 = num as i32;
+    let num_buffer = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("buf-elems-count"),
+            contents: bytemuck::bytes_of(&num_i32),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("to-montgomery-bind-group"),
+        layout: &ctx.to_mont_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: input_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: num_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    log_timing(
+        "  Canon->Mont buffer creation + bind group",
+        now_ms() - buffer_start,
+    );
+
+    // Time dispatch
+    let dispatch_start = now_ms();
+    let workgroup_size = WORKGROUP_SIZE;
+    debug_assert!(workgroup_size <= 256);
+    //let workgroups_x = ((num as u32) + workgroup_size - 1) / workgroup_size;
+
+    const MAX_DIM: usize = 1 << 16; // maximum dimension of a workgroup
+                                    // we divide `maxDim` by 2 so that the max X dim is 2^15 = 32768
+    let workgroups_y = if num >= MAX_DIM {
+        num / (MAX_DIM / 2)
+    } else {
+        1
+    };
+    let num_blocks_x = (num + workgroups_y - 1) / workgroups_y;
+
+    log::info!(
+        "Starting workgroups in (x, y) : ({}, {})",
+        num_blocks_x,
+        workgroups_y
+    );
+
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("buf-canon-mont-encoder"),
+        });
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("buf-canon-mont-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&ctx.to_mont_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        //pass.dispatch_workgroups(workgroups_x, 1, 1);
+        pass.dispatch_workgroups(num_blocks_x as u32, workgroups_y as u32, 1);
+    }
+
+    ctx.queue.submit(Some(encoder.finish()));
+    ctx.queue.on_submitted_work_done(|| {});
+    log_timing("  Canon->Mont dispatch", now_ms() - dispatch_start);
+
+    input_buffer
+}
+
+
+fn leaf_info<F>(leaves: &[Vec<F>]) -> (usize, usize)
+where
+    F: RichField + Poseidon,
+{
+    // TODO: Transpose the leaf nodes here
+    let num_leaves = leaves.len();
+    let elements_per_leaf = leaves[0].len();
+    (num_leaves, elements_per_leaf)
+}
+
 /// Run the GPU Merkle tree pipeline, returning a job that resolves once GPU buffers are ready.
 pub fn build_merkle_tree<F>(
     ctx: Rc<MerkleTreeGpuContext>,
@@ -1021,8 +1246,17 @@ where
     let total_start = now_ms();
 
     let ctx_ref = ctx.as_ref();
-    let num_leaves = leaves.len();
+
+    let (num_leaves, elements_per_leaf) = leaf_info(leaves);
     ensure!(num_leaves > 0, "Merkle tree requires at least one leaf");
+    ensure!(
+        num_leaves <= i32::MAX as usize,
+        "Merkle GPU hashing expects leaf count to fit in i32, got {num_leaves}"
+    );
+    ensure!(
+        leaves.iter().all(|leaf| leaf.len() == elements_per_leaf),
+        "GPU Poseidon hashing requires leaves of uniform length"
+    );
     ensure!(
         num_leaves.is_power_of_two(),
         "GPU Merkle currently expects a power-of-two leaf count"
@@ -1034,11 +1268,38 @@ where
         "cap_height {cap_height} exceeds tree depth {depth}"
     );
 
+    // Time data conversion
+    let convert_start = now_ms();
+    let (transposed, elements_per_leaf) = transpose_leaves(leaves);
+    ensure!(
+        elements_per_leaf > 0,
+        "GPU Poseidon hashing received empty leaves"
+    );
+    ensure!(
+        elements_per_leaf <= i32::MAX as usize,
+        "elements_per_leaf must fit in i32, got {elements_per_leaf}"
+    );
+    log_timing("  Leaf data transpose", now_ms() - convert_start);
+
+    // TODO: Perform single canonical -> Montgomery representation pass on inputs
+
+    // Convert transposed data into Montgomery form, get buffer
+    //let transposed_words = fields_to_montgomery_words(&transposed);
+    let canon_to_mont_start = now_ms();
+    let input_buffer =
+        canonical_to_montgomery_gpu(&ctx, &transposed, num_leaves * elements_per_leaf);
+    log_timing(
+        "  Leaf data Canonical -> Montgomery conversion",
+        now_ms() - canon_to_mont_start,
+    );
+
+    // TODO: After main Merkle tree kernel calls: single Montgomery -> canonical pass for all digsts / nodes
+
     // PHASE 1: Leaf hashing setup and dispatch
     console::log_1(&"=== PHASE 1: Leaf Hashing ===".into());
     let leaf_start = now_ms();
     log("launching GPU Poseidon hashing");
-    let leaf_buffer = hash_leaves_gpu(ctx_ref, leaves)?;
+    let leaf_buffer = hash_leaves_gpu(ctx_ref, input_buffer, num_leaves, elements_per_leaf)?;
     log("queued GPU Poseidon hashing");
     log_timing("Leaf hash setup + dispatch", now_ms() - leaf_start);
 
