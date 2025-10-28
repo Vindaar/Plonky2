@@ -11,6 +11,8 @@
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, ensure, Result};
 use bytemuck::{Pod, Zeroable};
@@ -19,7 +21,7 @@ use futures::future::{poll_fn, FutureExt};
 use once_cell::unsync::OnceCell;
 use web_sys::console;
 use wgpu::util::DeviceExt;
-use wgpu::{BindGroupLayout, Buffer, ComputePipeline, Device, Queue};
+use wgpu::{BindGroupLayout, Buffer, ComputePipeline, Device, Queue, SubmissionIndex};
 
 use crate::hash::hash_types::{HashOut, RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::poseidon::{self, Poseidon, SPONGE_WIDTH};
@@ -83,8 +85,22 @@ impl MerkleTreeGpuContext {
         mds_diag: Buffer,
         round_constants: Buffer,
     ) -> Self {
+        let device = Rc::new(device);
+        device.on_uncaptured_error(Box::new(|error| {
+            #[cfg(target_arch = "wasm32")]
+            {
+                console::error_1(
+                    &format!("⚠️ WebGPU uncaptured error in Merkle context: {error:?}").into(),
+                );
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                eprintln!("⚠️ WebGPU uncaptured error in Merkle context: {error:?}");
+            }
+        }));
+
         Self {
-            device: Rc::new(device),
+            device,
             queue: Rc::new(queue),
             merkle_pipeline: Rc::new(merkle_pipeline),
             merkle_bind_group_layout: Rc::new(merkle_bind_group_layout),
@@ -185,6 +201,11 @@ fn log(msg: &str) {
     {
         println!("{msg}");
     }
+}
+
+fn log_queue_submission(label: &str, index: SubmissionIndex) {
+    let message = format!("📤 Queue submit -> {label} (submission_index={index:?})");
+    log(&message);
 }
 
 // ============================================================================
@@ -751,6 +772,7 @@ enum MerkleGpuJobState<F: RichField> {
         num_leaves: usize,
         cap_height: usize,
         num_layers_to_cap: usize,
+        last_submission: Option<SubmissionIndex>,
     },
 }
 
@@ -779,6 +801,7 @@ where
         num_leaves: usize,
         cap_height: usize,
         num_layers_to_cap: usize,
+        last_submission: Option<SubmissionIndex>,
     ) -> Self {
         Self {
             state: MerkleGpuJobState::Deferred {
@@ -789,6 +812,7 @@ where
                 num_leaves,
                 cap_height,
                 num_layers_to_cap,
+                last_submission,
             },
             _marker: PhantomData,
         }
@@ -805,13 +829,26 @@ where
                 num_leaves,
                 cap_height,
                 num_layers_to_cap,
+                last_submission,
             } => {
                 console::log_1(&"=== PHASE 4: GPU Completion & Readback ===".into());
+                if let Some(index) = &last_submission {
+                    log(&format!(
+                        "wait_for_queue expecting latest submission index: {index:?}"
+                    ));
+                } else {
+                    log("wait_for_queue expects submission index: <none recorded>");
+                }
                 let readback_start = now_ms();
 
                 // Wait for GPU to finish
                 let wait_start = now_ms();
-                wait_for_queue(context.queue.clone()).await?;
+                wait_for_queue(
+                    context.device.clone(),
+                    context.queue.clone(),
+                    last_submission.clone(),
+                )
+                .await?;
                 log_timing("⚡ GPU execution (wait_for_queue)", now_ms() - wait_start);
 
                 // Read leaf hashes
@@ -965,14 +1002,115 @@ fn create_buffers(
     MerkleBuffers { input, nodes, cap }
 }
 
-async fn wait_for_queue(queue: Rc<Queue>) -> Result<()> {
-    let (sender, receiver) = oneshot::channel();
-    queue.on_submitted_work_done(move || {
-        let _ = sender.send(());
-    });
-    receiver
-        .await
-        .map_err(|_| anyhow!("queue completion receiver dropped"))?;
+async fn wait_for_queue(
+    device: Rc<Device>,
+    queue: Rc<Queue>,
+    expected_submission: Option<SubmissionIndex>,
+) -> Result<()> {
+    if let Some(index) = &expected_submission {
+        log(&format!(
+            "wait_for_queue -> start (expected submission index: {index:?})"
+        ));
+    } else {
+        log("wait_for_queue -> start (no submission index recorded)");
+    }
+
+    let poll_target = expected_submission.clone();
+
+    let (sender, receiver) = oneshot::channel::<()>();
+    let sender_holder = Arc::new(Mutex::new(Some(sender)));
+    let callback_flag = Arc::new(AtomicBool::new(false));
+    {
+        let callback_flag = Arc::clone(&callback_flag);
+        let sender_holder = Arc::clone(&sender_holder);
+        queue.on_submitted_work_done(move || {
+            log("wait_for_queue -> on_submitted_work_done invoked");
+            callback_flag.store(true, Ordering::SeqCst);
+            if let Ok(mut guard) = sender_holder.lock() {
+                if let Some(tx) = guard.take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+    }
+
+    let mut receiver = receiver.fuse();
+    let mut polls: u64 = 0;
+    let callback_flag_poll = Arc::clone(&callback_flag);
+    let sender_holder_poll = Arc::clone(&sender_holder);
+    poll_fn(move |cx| {
+        polls += 1;
+        let poll_type = poll_target
+            .clone()
+            .map_or(wgpu::PollType::Poll, wgpu::PollType::WaitForSubmissionIndex);
+        let poll_result = device.poll(poll_type);
+
+        if polls == 1 {
+            log(&format!(
+                "wait_for_queue poll[1]: poll_result={:?}, callback_fired={}",
+                poll_result,
+                callback_flag_poll.load(Ordering::Relaxed)
+            ));
+        } else if polls % 500 == 0 {
+            log(&format!(
+                "wait_for_queue poll[{polls}]: poll_result={:?}, callback_fired={}",
+                poll_result,
+                callback_flag_poll.load(Ordering::Relaxed)
+            ));
+        }
+
+        match poll_result {
+            Ok(status) => {
+                if status.wait_finished() {
+                    let already = callback_flag_poll.swap(true, Ordering::SeqCst);
+                    if !already {
+                        log(&format!(
+                            "wait_for_queue -> poll observed completion with status={status:?}"
+                        ));
+                        if let Ok(mut guard) = sender_holder_poll.lock() {
+                            if let Some(tx) = guard.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                log(&format!(
+                    "wait_for_queue -> device.poll reported error: {err:?}"
+                ));
+                if let Ok(mut guard) = sender_holder_poll.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                return std::task::Poll::Ready(Err(anyhow!("device.poll returned error: {err:?}")));
+            }
+        }
+
+        match receiver.poll_unpin(cx) {
+            std::task::Poll::Ready(res) => {
+                if !callback_flag_poll.load(Ordering::Relaxed) {
+                    log("wait_for_queue -> receiver ready before callback flag set");
+                }
+                std::task::Poll::Ready(
+                    res.map_err(|_| anyhow!("queue completion receiver dropped (oneshot)")),
+                )
+            }
+            std::task::Poll::Pending => {
+                if polls % 2000 == 0 {
+                    log("wait_for_queue -> still pending (awaiting callback)");
+                }
+                std::task::Poll::Pending
+            }
+        }
+    })
+    .await?;
+
+    log(&format!(
+        "wait_for_queue -> completed after {polls} polls (callback_fired={})",
+        callback_flag.load(Ordering::Relaxed)
+    ));
     Ok(())
 }
 
@@ -1005,7 +1143,7 @@ async fn read_u32_buffer_async(
     // Drive the device to make progress while we wait for the map to complete.
     let mut map_receiver = map_receiver.fuse();
     poll_fn(move |cx| {
-        device.poll(wgpu::PollType::Poll);
+        let _ = device.poll(wgpu::PollType::Poll);
         map_receiver.poll_unpin(cx)
     })
     .await
@@ -1041,7 +1179,7 @@ fn hash_leaves_gpu(
     leaf_buf: Buffer,
     num_leaves: usize,
     elements_per_leaf: usize,
-) -> Result<Buffer> {
+) -> Result<(Buffer, SubmissionIndex)> {
     // Time buffer creation
     let buffer_start = now_ms();
 
@@ -1133,11 +1271,12 @@ fn hash_leaves_gpu(
         pass.dispatch_workgroups(workgroups_x, 1, 1);
     }
 
-    ctx.queue.submit(Some(encoder.finish()));
+    let submission_index = ctx.queue.submit(Some(encoder.finish()));
+    log_queue_submission("hash_leaves_gpu", submission_index.clone());
     ctx.queue.on_submitted_work_done(|| {});
     log_timing("  Leaf dispatch", now_ms() - dispatch_start);
 
-    Ok(output_buffer)
+    Ok((output_buffer, submission_index))
 }
 
 /// Converts the input buffer from canonical representation into Montgomery representation for
@@ -1145,25 +1284,19 @@ fn hash_leaves_gpu(
 /// `num` is the number of field elements in the buffer.
 fn canonical_to_montgomery_gpu<F>(
     ctx: &MerkleTreeGpuContext,
-    transposed: &Vec<F>,
+    transposed: &[F],
     num: usize,
-) -> Buffer
+) -> (Buffer, SubmissionIndex)
 where
     F: RichField + Poseidon,
 {
-    // Time data conversion
-    let convert_start = now_ms();
-
     let input_buffer = ctx
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("poseidon-leaf-input"),
-            contents: bytemuck::cast_slice(&fields_to_words(&transposed)),
+            contents: bytemuck::cast_slice(&fields_to_words(transposed)),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-
-    // Time buffer creation
-    let buffer_start = now_ms();
 
     let num_i32 = num as i32;
     let num_buffer = ctx
@@ -1188,11 +1321,6 @@ where
             },
         ],
     });
-    log_timing(
-        "  Canon->Mont buffer creation + bind group",
-        now_ms() - buffer_start,
-    );
-
     // Time dispatch
     let dispatch_start = now_ms();
     let workgroup_size = WORKGROUP_SIZE;
@@ -1231,19 +1359,26 @@ where
         pass.dispatch_workgroups(num_blocks_x as u32, workgroups_y as u32, 1);
     }
 
-    ctx.queue.submit(Some(encoder.finish()));
+    let submission_index = ctx.queue.submit(Some(encoder.finish()));
+    log_queue_submission("canonical_to_montgomery_gpu", submission_index.clone());
     ctx.queue.on_submitted_work_done(|| {});
     log_timing("  Canon->Mont dispatch", now_ms() - dispatch_start);
 
-    input_buffer
+    (input_buffer, submission_index)
 }
 
 /// Converts the input buffer from Montgomery representation into canonical representation
 /// to put it back into the form Plonky2 expects.
 /// `num` is the number of field elements in the buffer.
-fn montgomery_to_canonical_gpu(ctx: &MerkleTreeGpuContext, buf: &Buffer, num: u32) {
-    // Time data conversion
-    let convert_start = now_ms();
+fn montgomery_to_canonical_gpu(
+    ctx: &MerkleTreeGpuContext,
+    buf: &Buffer,
+    num: u32,
+) -> Option<SubmissionIndex> {
+    if num == 0 {
+        log("montgomery_to_canonical_gpu skipped (num == 0)");
+        return None;
+    }
 
     // Time buffer creation
     let buffer_start = now_ms();
@@ -1298,9 +1433,12 @@ fn montgomery_to_canonical_gpu(ctx: &MerkleTreeGpuContext, buf: &Buffer, num: u3
         pass.dispatch_workgroups(workgroups_x, 1, 1);
     }
 
-    ctx.queue.submit(Some(encoder.finish()));
+    let submission_index = ctx.queue.submit(Some(encoder.finish()));
+    log_queue_submission("montgomery_to_canonical_gpu", submission_index.clone());
     ctx.queue.on_submitted_work_done(|| {});
     log_timing("  Mont->Canon dispatch", now_ms() - dispatch_start);
+
+    Some(submission_index)
 }
 
 fn leaf_info<F>(leaves: &[Vec<F>]) -> (usize, usize)
@@ -1325,8 +1463,13 @@ where
     let total_start = now_ms();
 
     let ctx_ref = ctx.as_ref();
+    let mut last_submission_index: Option<SubmissionIndex> = None;
 
     let (num_leaves, elements_per_leaf) = leaf_info(leaves);
+    let config_msg = format!(
+        "GPU Merkle config -> leaves: {num_leaves}, elements_per_leaf: {elements_per_leaf}, cap_height: {cap_height}"
+    );
+    log(&config_msg);
     ensure!(num_leaves > 0, "Merkle tree requires at least one leaf");
     ensure!(
         num_leaves <= i32::MAX as usize,
@@ -1346,6 +1489,8 @@ where
         cap_height <= depth,
         "cap_height {cap_height} exceeds tree depth {depth}"
     );
+    let depth_msg = format!("GPU Merkle depth -> depth: {depth}");
+    log(&depth_msg);
 
     // Time data conversion
     let convert_start = now_ms();
@@ -1365,8 +1510,9 @@ where
     // Convert transposed data into Montgomery form, get buffer
     //let transposed_words = fields_to_montgomery_words(&transposed);
     let canon_to_mont_start = now_ms();
-    let input_buffer =
+    let (input_buffer, submission_index) =
         canonical_to_montgomery_gpu(&ctx, &transposed, num_leaves * elements_per_leaf);
+    last_submission_index.replace(submission_index);
     log_timing(
         "  Leaf data Canonical -> Montgomery conversion",
         now_ms() - canon_to_mont_start,
@@ -1378,7 +1524,9 @@ where
     console::log_1(&"=== PHASE 1: Leaf Hashing ===".into());
     let leaf_start = now_ms();
     log("launching GPU Poseidon hashing");
-    let leaf_buffer = hash_leaves_gpu(ctx_ref, input_buffer, num_leaves, elements_per_leaf)?;
+    let (leaf_buffer, submission_index) =
+        hash_leaves_gpu(ctx_ref, input_buffer, num_leaves, elements_per_leaf)?;
+    last_submission_index.replace(submission_index);
     log("queued GPU Poseidon hashing");
     log_timing("Leaf hash setup + dispatch", now_ms() - leaf_start);
 
@@ -1391,6 +1539,20 @@ where
     let total_nodes: usize = (1..num_layers_to_cap)
         .map(|layer| host_layer_size(num_leaves, layer))
         .sum();
+    let sizing_msg = format!(
+        "GPU Merkle sizing -> num_layers_to_root: {num_layers_to_root}, num_layers_to_cap: {num_layers_to_cap}, cap_len: {cap_len}, total_internal_nodes: {total_nodes}"
+    );
+    log(&sizing_msg);
+
+    if total_nodes == 0 {
+        let fallback_msg = format!(
+            "GPU Merkle fallback: total_internal_nodes is zero (leaves={num_leaves}, cap_height={cap_height}, num_layers_to_cap={num_layers_to_cap}). Falling back to CPU."
+        );
+        log(&fallback_msg);
+        return Err(anyhow!(
+            "GPU Merkle skipped: total_internal_nodes == 0 for leaves={num_leaves}, cap_height={cap_height}"
+        ));
+    }
 
     let buffer_start = now_ms();
     let buffers = create_buffers(ctx_ref, leaf_buffer, total_nodes, cap_len);
@@ -1423,6 +1585,10 @@ where
             0
         };
         let write_to_cap = (layer + 1) == num_layers_to_cap;
+        let layer_sizes_msg = format!(
+            "  layer sizes -> layer: {layer}, src_layer_size: {src_layer_size}, dst_layer_size: {dst_layer_size}, src_offset: {src_offset}, dst_offset: {dst_offset}, write_to_cap: {write_to_cap}"
+        );
+        log(&layer_sizes_msg);
 
         let args = MerkleTreeKernelArgs {
             cap_len: cap_len as u32,
@@ -1508,8 +1674,10 @@ where
 
         // Time submission (should be fast)
         let submit_start = now_ms();
-        ctx_ref.queue.submit(Some(encoder.finish()));
+        let submission_index = ctx_ref.queue.submit(Some(encoder.finish()));
+        log_queue_submission(&format!("merkle_layer_{layer}"), submission_index.clone());
         ctx_ref.queue.on_submitted_work_done(|| {});
+        last_submission_index.replace(submission_index);
         let submit_time = now_ms() - submit_start;
 
         let layer_time = now_ms() - layer_start;
@@ -1523,16 +1691,20 @@ where
     }
 
     // Convert input buffer (leaf nodes) from Montgomery into canonical repr
-    montgomery_to_canonical_gpu(
+    if let Some(submission_index) = montgomery_to_canonical_gpu(
         ctx_ref,
         &buffers.input,
         (num_leaves * NUM_HASH_OUT_ELTS) as u32,
-    );
-    montgomery_to_canonical_gpu(
+    ) {
+        last_submission_index.replace(submission_index);
+    }
+    if let Some(submission_index) = montgomery_to_canonical_gpu(
         ctx_ref,
         &buffers.nodes,
         (total_nodes * NUM_HASH_OUT_ELTS) as u32,
-    );
+    ) {
+        last_submission_index.replace(submission_index);
+    }
 
     let total_layer_time = now_ms() - layer_setup_start;
     log_timing("Total layer setup + dispatch", total_layer_time);
@@ -1545,6 +1717,10 @@ where
         total_setup_time,
     );
 
+    if last_submission_index.is_none() {
+        log("Merkle GPU pipeline recorded no queue submissions before wait (unexpected)");
+    }
+
     Ok(MerkleGpuJob::deferred(
         ctx,
         buffers,
@@ -1553,6 +1729,7 @@ where
         num_leaves,
         cap_height,
         num_layers_to_cap,
+        last_submission_index,
     ))
 }
 

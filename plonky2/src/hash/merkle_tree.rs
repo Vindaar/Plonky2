@@ -237,6 +237,14 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
     async fn build_gpu(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
         log_merkle_tree_size_gpu(leaves.len());
+        let leaf_count = leaves.len();
+        if leaf_count == 0 {
+            return Self::build_cpu(leaves, cap_height);
+        }
+        let log2_leaves = log2_strict(leaf_count);
+        if cap_height >= log2_leaves {
+            return Self::build_cpu(leaves, cap_height);
+        }
         if let Some(result) = merkle_tree_gpu::try_build_merkle_tree::<F>(&leaves, cap_height) {
             match result {
                 Ok(job) => match job.await_async().await {

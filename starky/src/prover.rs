@@ -420,6 +420,7 @@ where
 
 /// Synchronous proving with precomputed commitments is unsupported on `wasm32` with `gpu_merkle`; call [`prove_with_commitment_async`] instead.
 #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+#[track_caller]
 pub fn prove_with_commitment<F, C, S, const D: usize>(
     _stark: &S,
     _config: &StarkConfig,
@@ -436,6 +437,17 @@ where
     C: GenericConfig<D, F = F>,
     S: Stark<F, D>,
 {
+    #[cfg(feature = "std")]
+    {
+        use std::backtrace::Backtrace;
+        let bt = Backtrace::force_capture();
+        let caller = core::panic::Location::caller();
+        log::error!(
+            "Unexpected call to starky::prover::prove_with_commitment on wasm32+gpu_merkle from {}:{}.\nBacktrace:\n{bt}",
+            caller.file(),
+            caller.line()
+        );
+    }
     panic!("Stark prover must be awaited on wasm with gpu_merkle enabled; use prove_with_commitment_async instead");
 }
 
