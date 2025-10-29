@@ -8,16 +8,19 @@
 
 #![cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
 
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, ensure, Result};
 use bytemuck::{Pod, Zeroable};
 use futures::channel::oneshot;
 use futures::future::{poll_fn, FutureExt};
+use futures::pin_mut;
+use gloo_timers::callback::Timeout;
 use once_cell::unsync::OnceCell;
 use web_sys::console;
 use wgpu::util::DeviceExt;
@@ -40,7 +43,9 @@ const ROUND_CONSTANT_COUNT: usize = POSEIDON_WIDTH * poseidon::N_ROUNDS;
 const WORKGROUP_SIZE: u32 = 64;
 
 // for `now` for timing
+use js_sys::Promise;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 thread_local! {
     /// WebGPU context reused across Merkle tree constructions.
@@ -65,6 +70,11 @@ pub struct MerkleTreeGpuContext {
     pub mds_circ: Buffer,
     pub mds_diag: Buffer,
     pub round_constants: Buffer,
+
+    // Cached staging buffer for readbacks (web: reused to avoid churn)
+    pub readback_staging: RefCell<Option<Buffer>>,
+    pub readback_capacity: RefCell<u64>,
+    pub readback_busy: RefCell<bool>,
 }
 
 impl MerkleTreeGpuContext {
@@ -89,13 +99,9 @@ impl MerkleTreeGpuContext {
         device.on_uncaptured_error(Box::new(|error| {
             #[cfg(target_arch = "wasm32")]
             {
-                console::error_1(
+                web_sys::console::error_1(
                     &format!("⚠️ WebGPU uncaptured error in Merkle context: {error:?}").into(),
                 );
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                eprintln!("⚠️ WebGPU uncaptured error in Merkle context: {error:?}");
             }
         }));
 
@@ -110,10 +116,32 @@ impl MerkleTreeGpuContext {
             to_mont_bind_group_layout: Rc::new(to_mont_bind_group_layout),
             to_canon_pipeline: Rc::new(to_canon_pipeline),
             to_canon_bind_group_layout: Rc::new(to_canon_bind_group_layout),
+            readback_staging: RefCell::new(None),
+            readback_capacity: RefCell::new(0),
             mds_circ,
             mds_diag,
             round_constants,
+            readback_busy: RefCell::new(false),
         }
+    }
+}
+
+impl MerkleTreeGpuContext {
+    fn get_or_make_staging(&self, size: u64) -> Buffer {
+        let mut cap = self.readback_capacity.borrow_mut();
+        let mut buf_opt = self.readback_staging.borrow_mut();
+        let need_new = buf_opt.is_none() || *cap < size;
+        if need_new {
+            let new_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("merkle-readback-staging"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            *buf_opt = Some(new_buf);
+            *cap = size;
+        }
+        buf_opt.as_ref().unwrap().clone()
     }
 }
 
@@ -208,6 +236,131 @@ fn log_queue_submission(label: &str, index: SubmissionIndex) {
     log(&message);
 }
 
+/// Tracks in-flight readbacks to catch staging buffer leaks between Merkle trees.
+static ACTIVE_READBACKS: AtomicU32 = AtomicU32::new(0);
+/// Counts mapped slices to guarantee every `map_async` is balanced with an `unmap`.
+static ACTIVE_MAPPED_SLICES: AtomicU32 = AtomicU32::new(0);
+/// Monotonic identifier used to correlate instrumentation logs.
+static READBACK_SEQ: AtomicU32 = AtomicU32::new(1);
+
+struct ReadbackGuard {
+    label: String,
+    size_bytes: u64,
+    active: bool,
+}
+
+impl ReadbackGuard {
+    fn new(label: String, size_bytes: u64) -> Self {
+        let previous = ACTIVE_READBACKS.fetch_add(1, Ordering::SeqCst);
+        if previous != 0 {
+            log(&format!(
+                "⚠️ {label} starting while {previous} other readback(s) remain active"
+            ));
+        }
+        debug_assert!(
+            previous == 0,
+            "{label} expected no overlapping readbacks (active before start = {previous})"
+        );
+        log(&format!(
+            "{label} begin -> staging_size={} bytes (active_readbacks={})",
+            size_bytes,
+            previous + 1
+        ));
+
+        Self {
+            label,
+            size_bytes,
+            active: true,
+        }
+    }
+
+    fn release(&mut self, reason: &str) {
+        if !self.active {
+            return;
+        }
+
+        let previous = ACTIVE_READBACKS.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(
+            previous > 0,
+            "{} underflow while releasing readback guard",
+            self.label
+        );
+        log(&format!(
+            "{} end ({reason}) -> staging_size={} bytes (active_readbacks={})",
+            self.label,
+            self.size_bytes,
+            previous - 1
+        ));
+        self.active = false;
+    }
+}
+
+impl Drop for ReadbackGuard {
+    fn drop(&mut self) {
+        self.release("drop");
+    }
+}
+
+struct MappedSliceGuard {
+    label: String,
+    active: bool,
+}
+
+impl MappedSliceGuard {
+    fn new(label: String) -> Self {
+        let previous = ACTIVE_MAPPED_SLICES.fetch_add(1, Ordering::SeqCst);
+        log(&format!(
+            "{label} map_guard begin (active_mapped_slices={})",
+            previous + 1
+        ));
+        Self {
+            label,
+            active: true,
+        }
+    }
+
+    fn release(&mut self, reason: &str) {
+        if !self.active {
+            return;
+        }
+
+        let previous = ACTIVE_MAPPED_SLICES.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(
+            previous > 0,
+            "{} underflow while releasing mapped slice guard",
+            self.label
+        );
+        log(&format!(
+            "{} map_guard end ({reason}) -> active_mapped_slices={}",
+            self.label,
+            previous - 1
+        ));
+        self.active = false;
+    }
+}
+
+impl Drop for MappedSliceGuard {
+    fn drop(&mut self) {
+        self.release("drop");
+    }
+}
+
+struct BusyFlagGuard<'a> {
+    flag: &'a RefCell<bool>,
+}
+
+impl<'a> BusyFlagGuard<'a> {
+    fn new(flag: &'a RefCell<bool>) -> Self {
+        Self { flag }
+    }
+}
+
+impl Drop for BusyFlagGuard<'_> {
+    fn drop(&mut self) {
+        *self.flag.borrow_mut() = false;
+    }
+}
+
 // ============================================================================
 // PROFILING HELPERS
 // ============================================================================
@@ -244,6 +397,50 @@ fn log_timing(label: &str, duration_ms: f64) {
     {
         println!("⏱️  {}: {:.2}ms", label, duration_ms);
     }
+}
+
+/// Yield back to the JS event loop to give pending GPU callbacks a chance to fire.
+async fn yield_to_event_loop() {
+    let promise = Promise::resolve(&JsValue::NULL);
+    let _ = JsFuture::from(promise).await;
+}
+
+/// Helper that pops a previously-pushed error scope, polling the device until the
+/// result is ready so we can surface validation/OOM diagnostics even on wasm.
+async fn pop_error_scope_with_poll(device: Rc<Device>, label: String) -> Option<wgpu::Error> {
+    let log_prefix = label.clone();
+    let (sender, receiver) = oneshot::channel();
+    let pop_future = device.pop_error_scope();
+    spawn_local(async move {
+        let result = pop_future.await;
+        if let Some(ref err) = result {
+            log(&format!("{log_prefix} -> error: {err:?}"));
+        } else {
+            log(&format!("{log_prefix} -> no error"));
+        }
+        let _ = sender.send(result);
+    });
+
+    let mut receiver = receiver;
+    poll_fn(|cx| match receiver.poll_unpin(cx) {
+        std::task::Poll::Ready(res) => {
+            return std::task::Poll::Ready(res.unwrap_or(None));
+        }
+        std::task::Poll::Pending => {
+            if let Err(err) = device.poll(wgpu::PollType::Poll) {
+                log(&format!(
+                    "{label} -> device.poll returned error while awaiting pop: {err:?}"
+                ));
+            }
+            let waker = cx.waker().clone();
+            spawn_local(async move {
+                yield_to_event_loop().await;
+                waker.wake();
+            });
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 /// Initialize the global WebGPU context. Subsequent calls are no-ops.
@@ -853,13 +1050,9 @@ where
 
                 // Read leaf hashes
                 let leaf_read_start = now_ms();
-                let leaf_words = read_u32_buffer_async(
-                    context.device.clone(),
-                    context.queue.clone(),
-                    &buffers.input,
-                    num_leaves * WORDS_PER_DIGEST,
-                )
-                .await?;
+                let leaf_words =
+                    read_u32_buffer_async(&context, &buffers.input, num_leaves * WORDS_PER_DIGEST)
+                        .await?;
                 log_timing("Leaf hash readback", now_ms() - leaf_read_start);
 
                 let leaf_convert_start = now_ms();
@@ -873,8 +1066,7 @@ where
                 let node_read_start = now_ms();
                 let node_hashes: Vec<HashOut<F>> = if total_nodes > 0 {
                     let node_words = read_u32_buffer_async(
-                        context.device.clone(),
-                        context.queue.clone(),
+                        &context,
                         &buffers.nodes,
                         total_nodes * WORDS_PER_DIGEST,
                     )
@@ -894,13 +1086,9 @@ where
 
                 // Read cap
                 let cap_read_start = now_ms();
-                let cap_words = read_u32_buffer_async(
-                    context.device.clone(),
-                    context.queue.clone(),
-                    &buffers.cap,
-                    cap_len * WORDS_PER_DIGEST,
-                )
-                .await?;
+                let cap_words =
+                    read_u32_buffer_async(&context, &buffers.cap, cap_len * WORDS_PER_DIGEST)
+                        .await?;
                 log_timing("Cap readback", now_ms() - cap_read_start);
 
                 let cap_convert_start = now_ms();
@@ -1115,47 +1303,150 @@ async fn wait_for_queue(
 }
 
 async fn read_u32_buffer_async(
-    device: Rc<Device>,
-    queue: Rc<Queue>,
-    buffer: &Buffer,
+    context: &MerkleTreeGpuContext,
+    buffer: &wgpu::Buffer,
     word_len: usize,
 ) -> Result<Vec<u32>> {
-    log("read u32 buffer start");
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("merkle-readback"),
-        size: (word_len * std::mem::size_of::<u32>()) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    {
+        let mut busy = context.readback_busy.borrow_mut();
+        if *busy {
+            // If you prefer, return Err(...) instead of panic/log.
+            log("readback requested while previous readback still in-flight");
+            // Early yield so the previous callback can progress.
+            gloo_timers::future::TimeoutFuture::new(0).await;
+            // re-check or bail out:
+            ensure!(!*busy, "concurrent readback detected");
+        }
+        *busy = true;
+    }
+    let busy_guard = BusyFlagGuard::new(&context.readback_busy);
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("copy merkle buffer"),
-    });
-    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, staging.size());
-    queue.submit(Some(encoder.finish()));
+    let readback_id = READBACK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let label = format!("readback[{readback_id}]");
+    let staging_size = (word_len * core::mem::size_of::<u32>()) as u64;
+    let mut readback_guard = ReadbackGuard::new(label.clone(), staging_size);
+    log(&format!(
+        "{label} start -> word_len={word_len}, staging_size={staging_size} bytes, source_buffer_size={} bytes",
+        buffer.size()
+    ));
 
-    let slice = staging.slice(..);
-    let (map_sender, map_receiver) = oneshot::channel();
+    // Reuse staging buffer (may be larger than this readback)
+    let staging = context.get_or_make_staging(staging_size);
+
+    context
+        .device
+        .push_error_scope(wgpu::ErrorFilter::Validation);
+
+    // Encode copy to staging
+    let mut encoder = context
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("merkle-readback-encoder"),
+        });
+    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, staging_size);
+    log(&format!(
+        "{label} -> submitting copy_buffer_to_buffer of {staging_size} bytes"
+    ));
+    let submission_index = context.queue.submit(Some(encoder.finish()));
+    log_queue_submission(&format!("{label} copy"), submission_index);
+    log(&format!("{label} copy submitted"));
+
+    // Only map the region we wrote this iteration
+    let slice = staging.slice(0..staging_size);
+
+    let mut map_guard = MappedSliceGuard::new(label.clone());
+
+    let (map_tx, map_rx) = futures_channel::oneshot::channel();
+    log(&format!("{label} map_async registering"));
     slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = map_sender.send(res);
+        let _ = map_tx.send(res);
     });
 
-    // Drive the device to make progress while we wait for the map to complete.
-    let mut map_receiver = map_receiver.fuse();
-    poll_fn(move |cx| {
-        let _ = device.poll(wgpu::PollType::Poll);
-        map_receiver.poll_unpin(cx)
-    })
-    .await
-    .map_err(|_| anyhow!("failed to receive map result"))?
-    .map_err(|err| anyhow!("failed to map buffer: {err}"))?;
-    log::info!("Result received.");
+    let wait_map = map_rx
+        .map(|res| match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::anyhow!("map_async error: {e:?}")),
+            Err(_) => Err(anyhow::anyhow!("map_async callback dropped")),
+        })
+        .fuse();
+    let timeout_ms: u32 = 5_000;
+    let (timeout_tx, timeout_rx) = futures_channel::oneshot::channel::<()>();
+    let closure_label = label.clone();
+    let mut timeout_handle = Some(Timeout::new(timeout_ms, move || {
+        log(&format!(
+            "{closure_label} map_async watchdog timer fired (setTimeout)"
+        ));
+        let _ = timeout_tx.send(());
+    }));
+    let timeout_label = label.clone();
+    let timeout_rx = timeout_rx
+        .map(move |res| match res {
+            Ok(()) => Err(anyhow::anyhow!(
+                "{timeout_label} map_async timed out after {timeout_ms}ms"
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "{timeout_label} map_async watchdog channel dropped before firing"
+            )),
+        })
+        .fuse();
 
+    log(&format!("{label} awaiting map_async completion"));
+    pin_mut!(wait_map, timeout_rx);
+    let map_result: Result<()> = futures::select! {
+        res = wait_map => {
+            if let Some(handle) = timeout_handle.take() {
+                handle.cancel();
+            }
+            log(&format!("{label} map_async completed"));
+            res
+        }
+        timeout_err = timeout_rx => {
+            log(&format!("{label} map_async watchdog fired"));
+            timeout_err
+        }
+    };
+    if let Some(handle) = timeout_handle.take() {
+        handle.cancel();
+    }
+
+    if let Some(err) =
+        pop_error_scope_with_poll(context.device.clone(), format!("{label} validation scope")).await
+    {
+        map_guard.release("validation error");
+        readback_guard.release("validation error");
+        drop(busy_guard);
+        return Err(anyhow::anyhow!("validation error during readback: {err:?}"));
+    }
+
+    if let Err(err) = &map_result {
+        log(&format!("{label} map_async failed: {err:?}"));
+    }
+
+    if let Err(err) = map_result {
+        map_guard.release("map_async error");
+        readback_guard.release("map_async error");
+        drop(busy_guard);
+        return Err(err);
+    }
+
+    // Read only the bytes we mapped → exactly `word_len` u32s
     let data = slice.get_mapped_range();
-    let words = bytemuck::cast_slice(&data).to_vec();
+    let words_slice: &[u32] = bytemuck::cast_slice::<u8, u32>(&data);
+    debug_assert_eq!(
+        words_slice.len(),
+        word_len,
+        "{label} mapped words != expected word_len"
+    );
+    let words: Vec<u32> = words_slice.to_vec();
     drop(data);
     staging.unmap();
-    log("...done read u32 buffer start");
+    map_guard.release("success");
+    readback_guard.release("success");
+    drop(busy_guard);
+    // 🔸 Yield here: give the event loop a turn before the next readback starts
+    yield_to_event_loop().await;
+
+    log(&format!("{label} completed successfully"));
     Ok(words)
 }
 
@@ -1492,6 +1783,39 @@ where
     let depth_msg = format!("GPU Merkle depth -> depth: {depth}");
     log(&depth_msg);
 
+    let num_layers_to_root = depth;
+    let num_layers_to_cap = num_layers_to_root - cap_height;
+    let cap_len = 1usize << cap_height;
+
+    let total_nodes: usize = (1..num_layers_to_cap)
+        .map(|layer| host_layer_size(num_leaves, layer))
+        .sum();
+    let sizing_msg = format!(
+        "GPU Merkle sizing -> num_layers_to_root: {num_layers_to_root}, num_layers_to_cap: {num_layers_to_cap}, cap_len: {cap_len}, total_internal_nodes: {total_nodes}"
+    );
+    log(&sizing_msg);
+
+    if total_nodes == 0 {
+        let fallback_msg = format!(
+            "GPU Merkle fallback: total_internal_nodes is zero (leaves={num_leaves}, cap_height={cap_height}, num_layers_to_cap={num_layers_to_cap}). Falling back to CPU."
+        );
+        log(&fallback_msg);
+        return Err(anyhow!(
+            "GPU Merkle skipped: total_internal_nodes == 0 for leaves={num_leaves}, cap_height={cap_height}"
+        ));
+    }
+
+    // Optional: verify previous run didn’t leave state dirty
+    assert_eq!(
+        ACTIVE_MAPPED_SLICES.load(Ordering::SeqCst),
+        0,
+        "entered with a mapped slice"
+    );
+    assert!(
+        !*ctx_ref.readback_busy.borrow(),
+        "entered with readback_busy=true"
+    );
+
     // Time data conversion
     let convert_start = now_ms();
     let (transposed, elements_per_leaf) = transpose_leaves(leaves);
@@ -1532,27 +1856,6 @@ where
 
     // PHASE 2: Buffer allocation
     console::log_1(&"=== PHASE 2: Buffer Creation ===".into());
-    let num_layers_to_root = depth;
-    let num_layers_to_cap = num_layers_to_root - cap_height;
-    let cap_len = 1usize << cap_height;
-
-    let total_nodes: usize = (1..num_layers_to_cap)
-        .map(|layer| host_layer_size(num_leaves, layer))
-        .sum();
-    let sizing_msg = format!(
-        "GPU Merkle sizing -> num_layers_to_root: {num_layers_to_root}, num_layers_to_cap: {num_layers_to_cap}, cap_len: {cap_len}, total_internal_nodes: {total_nodes}"
-    );
-    log(&sizing_msg);
-
-    if total_nodes == 0 {
-        let fallback_msg = format!(
-            "GPU Merkle fallback: total_internal_nodes is zero (leaves={num_leaves}, cap_height={cap_height}, num_layers_to_cap={num_layers_to_cap}). Falling back to CPU."
-        );
-        log(&fallback_msg);
-        return Err(anyhow!(
-            "GPU Merkle skipped: total_internal_nodes == 0 for leaves={num_leaves}, cap_height={cap_height}"
-        ));
-    }
 
     let buffer_start = now_ms();
     let buffers = create_buffers(ctx_ref, leaf_buffer, total_nodes, cap_len);

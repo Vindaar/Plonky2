@@ -61,6 +61,8 @@ flume = "0.11"
 # For panic error messages in WASM code
 console_error_panic_hook = "0.1.7"
 
+gloo-timers = { version = "*", features = ["futures"] }
+
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 bytemuck = { version = "1.18", features = ["derive"], optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
