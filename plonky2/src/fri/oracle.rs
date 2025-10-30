@@ -18,6 +18,7 @@ use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::timed;
+use crate::util::profiling::with_timer;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
@@ -65,11 +66,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        let coeffs = timed!(
-            timing,
-            "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
-        );
+        let coeffs =
+            with_timer("PolynomialBatch::from_values IFFT", move || {
+                values
+                    .into_par_iter()
+                    .map(|v| v.ifft())
+                    .collect::<Vec<_>>()
+            });
 
         Self::from_coeffs(
             coeffs,
@@ -89,14 +92,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        let coeffs = timed!(
-            timing,
-            "IFFT",
-            values
-                .into_par_iter()
-                .map(|v| v.ifft())
-                .collect::<Vec<_>>()
-        );
+        let coeffs =
+            with_timer("PolynomialBatch::from_values_async IFFT", move || {
+                values
+                    .into_par_iter()
+                    .map(|v| v.ifft())
+                    .collect::<Vec<_>>()
+            });
 
         Self::from_coeffs_async(
             coeffs,
@@ -119,11 +121,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
         let degree = polynomials[0].len();
-        let lde_values = timed!(
-            timing,
-            "FFT + blinding",
+        let lde_values = with_timer("PolynomialBatch::from_coeffs FFT", || {
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
-        );
+        });
 
         let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
         reverse_index_bits_in_place(&mut leaves);
@@ -151,11 +151,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
         let degree = polynomials[0].len();
-        let lde_values = timed!(
-            timing,
-            "FFT + blinding",
+        let lde_values = with_timer("PolynomialBatch::from_coeffs_async FFT", || {
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
-        );
+        });
 
         let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
         reverse_index_bits_in_place(&mut leaves);

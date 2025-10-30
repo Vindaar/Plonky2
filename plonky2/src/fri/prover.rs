@@ -14,6 +14,7 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
+use crate::util::profiling::with_timer;
 use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
 
@@ -152,7 +153,7 @@ async fn fri_committed_trees_async<
                 .collect::<Vec<_>>(),
         );
         shift = shift.exp_u64(arity as u64);
-        values = coeffs.coset_fft(shift.into())
+        values = with_timer("FRI layer coset FFT", || coeffs.coset_fft(shift.into()))
     }
 
     // The coefficients being removed here should always be zero.

@@ -17,6 +17,7 @@ use plonky2::hash::hash_types::RichField;
 use plonky2::iop::challenger::Challenger;
 use plonky2::plonk::config::GenericConfig;
 use plonky2::timed;
+use plonky2::util::profiling::with_timer;
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, log2_strict, transpose};
 use plonky2_maybe_rayon::*;
@@ -885,13 +886,15 @@ where
         })
         .collect::<Vec<_>>();
 
-    Some(
+    let quotient_polys = with_timer("starky quotient coset IFFT", || {
         transpose(&quotient_values)
             .into_par_iter()
             .map(PolynomialValues::new)
             .map(|values| values.coset_ifft(F::coset_shift()))
-            .collect(),
-    )
+            .collect()
+    });
+
+    Some(quotient_polys)
 }
 
 /// Check that all constraints evaluate to zero on `H`.

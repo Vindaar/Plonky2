@@ -32,6 +32,7 @@ use crate::plonk::vanishing_poly::{eval_vanishing_poly_base_batch, get_lut_poly}
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
 use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_products};
+use crate::util::profiling::with_timer;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
 
@@ -922,9 +923,11 @@ fn compute_quotient_polys<
         })
         .collect();
 
-    transpose(&quotient_values)
-        .into_par_iter()
-        .map(PolynomialValues::new)
-        .map(|values| values.coset_ifft(F::coset_shift()))
-        .collect()
+    with_timer("plonk quotient coset IFFT", || {
+        transpose(&quotient_values)
+            .into_par_iter()
+            .map(PolynomialValues::new)
+            .map(|values| values.coset_ifft(F::coset_shift()))
+            .collect()
+    })
 }
