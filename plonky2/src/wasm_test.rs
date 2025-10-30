@@ -13,8 +13,13 @@ use crate::plonk::config::GenericHashOut;
 
 /// Test data from test-vector-small.txt embedded as a constant
 //const TEST_DATA: &str = include_str!("../../test-vector-small.txt");
+//const TEST_DATA: &str = include_str!("../../test-vector-4096-2431.txt");
 const TEST_DATA: &str = include_str!("../../test-vectors.txt");
 const TEST_DATA_8192: &str = include_str!("../../test-vector-8192-input.txt");
+
+/// Binary test data (524288 leaves × 86 elements per leaf)
+/// Uncomment when the binary file is available
+const TEST_DATA_BINARY: &[u8] = include_bytes!("../../test-vector-524288.bin");
 
 #[wasm_bindgen]
 pub async fn init_gpu_merkle() -> Result<(), JsValue> {
@@ -118,6 +123,89 @@ fn parse_test_vectors_8192() -> Vec<Vec<GoldilocksField>> {
     parse_test_vectors_from_str(TEST_DATA_8192)
 }
 
+/// Parse binary test vector data into nested vector of GoldilocksField elements
+///
+/// # Arguments
+/// * `data` - Raw binary data as a slice of bytes
+/// * `elems_per_leaf` - Number of field elements per leaf (e.g., 86)
+///
+/// # Format
+/// The binary data should contain field elements as 64-bit little-endian unsigned integers.
+/// Each element is 8 bytes, and elements are grouped into leaves of size `elems_per_leaf`.
+///
+/// # Example
+/// For 524288 leaves with 86 elements per leaf:
+/// - Total elements: 524288 × 86 = 45,088,768
+/// - Binary file size: 45,088,768 × 8 bytes = 360,710,144 bytes (~344 MB)
+fn parse_binary_test_vectors(data: &[u8], elems_per_leaf: usize) -> Vec<Vec<GoldilocksField>> {
+    const ELEMENT_SIZE: usize = 8; // GoldilocksField is u64 (8 bytes)
+
+    let total_elements = data.len() / ELEMENT_SIZE;
+    let expected_leaves = total_elements / elems_per_leaf;
+
+    web_sys::console::log_1(
+        &format!(
+            "Parsing binary test vectors: {} bytes, {} elements, {} leaves ({}×{})",
+            data.len(),
+            total_elements,
+            expected_leaves,
+            expected_leaves,
+            elems_per_leaf
+        )
+        .into(),
+    );
+
+    // Convert bytes to GoldilocksField elements
+    let mut elements = Vec::with_capacity(total_elements);
+    for chunk in data.chunks_exact(ELEMENT_SIZE) {
+        // Parse as little-endian u64
+        let bytes: [u8; 8] = chunk.try_into().expect("chunk is exactly 8 bytes");
+        let value = u64::from_le_bytes(bytes);
+        elements.push(GoldilocksField::from_canonical_u64(value));
+    }
+
+    // Warn if there are leftover bytes
+    if data.len() % ELEMENT_SIZE != 0 {
+        web_sys::console::warn_1(
+            &format!(
+                "Warning: {} leftover bytes in binary data (not a multiple of 8)",
+                data.len() % ELEMENT_SIZE
+            )
+            .into(),
+        );
+    }
+
+    // Reshape into leaves
+    let mut leaves = Vec::new();
+    for leaf_chunk in elements.chunks_exact(elems_per_leaf) {
+        leaves.push(leaf_chunk.to_vec());
+    }
+
+    // Warn if there are leftover elements that don't form a complete leaf
+    let leftover_elements = elements.len() % elems_per_leaf;
+    if leftover_elements != 0 {
+        web_sys::console::warn_1(
+            &format!(
+                "Warning: {} leftover elements (incomplete leaf with {} elements, expected {})",
+                leftover_elements, leftover_elements, elems_per_leaf
+            )
+            .into(),
+        );
+    }
+
+    web_sys::console::log_1(
+        &format!("Parsed {} complete leaves from binary data", leaves.len()).into(),
+    );
+
+    leaves
+}
+
+/// Parse binary test vectors with 524288 leaves × 86 elements per leaf
+/// Uncomment when TEST_DATA_BINARY is available
+fn parse_test_vectors_binary() -> Vec<Vec<GoldilocksField>> {
+    parse_binary_test_vectors(TEST_DATA_BINARY, 86)
+}
+
 /// Construct a Merkle tree using GPU acceleration and return statistics
 #[wasm_bindgen]
 pub async fn test_merkle_tree_construction() -> Result<JsValue, JsValue> {
@@ -209,7 +297,8 @@ pub async fn test_merkle_tree_cpu_vs_gpu() -> Result<JsValue, JsValue> {
 
     // Parse test vectors
     //let leaves = parse_test_vectors_8192();
-    let leaves = parse_test_vectors();
+    //let leaves = parse_test_vectors();
+    let leaves = parse_test_vectors_binary();
     let num_leaves = leaves.len();
 
     if num_leaves == 0 {
@@ -233,7 +322,7 @@ pub async fn test_merkle_tree_cpu_vs_gpu() -> Result<JsValue, JsValue> {
         &format!("Padded to {} leaves (2^{})", padded_size, log2_leaves).into(),
     );
 
-    let cap_height = 4;
+    let cap_height = 0;
 
     // Build on CPU first (reference implementation)
     web_sys::console::log_1(&"Building Merkle tree on CPU (reference)...".into());
