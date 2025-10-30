@@ -47,7 +47,7 @@ serde = { workspace = true, features = ["rc"] }
 static_assertions = { workspace = true }
 unroll = { workspace = true }
 web-time = { version = "1.0.0", optional = true }
-futures = { version = "0.3", optional = true, default-features = false, features = ["executor", "std"] }
+futures = { version = "0.3", optional = true, default-features = false, features = ["executor", "std", "async-await"] }
 futures-channel = "0.3"
 
 # Local dependencies

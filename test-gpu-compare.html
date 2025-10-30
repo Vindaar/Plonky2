@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Plonky2 GPU vs CPU Merkle Tree Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 10px 5px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #cccccc;
+            cursor: not-allowed;
+        }
+        #output {
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 4px;
+            margin-top: 20px;
+            white-space: pre-wrap;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        .success {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+        .error {
+            color: #f44336;
+            font-weight: bold;
+        }
+        .info {
+            color: #2196F3;
+        }
+        .warning {
+            color: #ff9800;
+        }
+        .status {
+            margin: 15px 0;
+            padding: 10px;
+            border-radius: 4px;
+            background: #e8f5e9;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Plonky2 GPU vs CPU Merkle Tree Comparison</h1>
+        <p>This test compares Merkle tree construction on CPU vs GPU using the 8192 test vectors.</p>
+
+        <div class="status" id="status">Status: Not initialized</div>
+
+        <button id="initBtn" onclick="initializeGPU()">1. Initialize GPU</button>
+        <button id="testBtn" onclick="runTest()" disabled>2. Run CPU vs GPU Test</button>
+
+        <div id="output"></div>
+    </div>
+
+    <script type="module">
+        import init, { init_gpu_merkle, test_merkle_tree_cpu_vs_gpu } from './plonky2/pkg/plonky2.js';
+
+        let wasmInitialized = false;
+        let gpuInitialized = false;
+
+        window.initializeGPU = async function() {
+            const output = document.getElementById('output');
+            const status = document.getElementById('status');
+            const initBtn = document.getElementById('initBtn');
+            const testBtn = document.getElementById('testBtn');
+
+            try {
+                initBtn.disabled = true;
+                status.textContent = 'Status: Initializing...';
+                output.textContent = 'Initializing WASM module...\n';
+
+                if (!wasmInitialized) {
+                    await init();
+                    wasmInitialized = true;
+                    output.textContent += '✓ WASM module initialized\n';
+                }
+
+                output.textContent += 'Initializing GPU context...\n';
+                await init_gpu_merkle();
+                gpuInitialized = true;
+
+                output.textContent += '✓ GPU initialized successfully!\n';
+                status.innerHTML = '<span class="success">Status: GPU Ready</span>';
+                testBtn.disabled = false;
+            } catch (err) {
+                output.textContent += '✗ Error: ' + err + '\n';
+                status.innerHTML = '<span class="error">Status: Initialization failed</span>';
+                initBtn.disabled = false;
+            }
+        };
+
+        window.runTest = async function() {
+            const output = document.getElementById('output');
+            const status = document.getElementById('status');
+            const testBtn = document.getElementById('testBtn');
+
+            if (!gpuInitialized) {
+                alert('Please initialize GPU first!');
+                return;
+            }
+
+            try {
+                testBtn.disabled = true;
+                status.textContent = 'Status: Running test...';
+                output.textContent = 'Starting CPU vs GPU comparison test...\n';
+                output.textContent += 'This may take a while with 8192 test vectors...\n\n';
+
+                const startTime = performance.now();
+                const result = await test_merkle_tree_cpu_vs_gpu();
+                const endTime = performance.now();
+
+                output.textContent += '\n' + '='.repeat(80) + '\n';
+                output.textContent += 'TEST RESULTS\n';
+                output.textContent += '='.repeat(80) + '\n\n';
+
+                output.textContent += `Total time: ${((endTime - startTime) / 1000).toFixed(2)}s\n`;
+                output.textContent += `Number of leaves: ${result.numLeaves}\n`;
+                output.textContent += `Padded size: ${result.paddedSize}\n`;
+                output.textContent += `Cap height: ${result.capHeight}\n\n`;
+
+                if (result.match) {
+                    output.textContent += '✓ SUCCESS: CPU and GPU results MATCH perfectly!\n\n';
+                    output.textContent += `CPU Root Hash: [${result.cpuRootHash}]\n`;
+                    output.textContent += `GPU Root Hash: [${result.gpuRootHash}]\n`;
+                    status.innerHTML = '<span class="success">Status: Test PASSED - Results match!</span>';
+                } else {
+                    output.textContent += '✗ FAILURE: CPU and GPU results DIFFER!\n\n';
+                    output.textContent += `Message: ${result.message}\n\n`;
+                    output.textContent += 'Differences:\n';
+                    output.textContent += result.differences + '\n\n';
+                    output.textContent += `CPU Root Hash: [${result.cpuRootHash}]\n`;
+                    output.textContent += `GPU Root Hash: [${result.gpuRootHash}]\n`;
+                    status.innerHTML = '<span class="error">Status: Test FAILED - Results differ!</span>';
+                }
+
+                testBtn.disabled = false;
+            } catch (err) {
+                output.textContent += '\n✗ Error during test: ' + err + '\n';
+                console.error('Test error:', err);
+                status.innerHTML = '<span class="error">Status: Test error</span>';
+                testBtn.disabled = false;
+            }
+        };
+    </script>
+</body>
+</html>
