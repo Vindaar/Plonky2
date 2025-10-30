@@ -287,6 +287,22 @@ where
         zs_partial_products
     };
 
+    #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+    let partial_products_zs_and_lookup_commitment = timed!(
+        timing,
+        "commit to partial products, Z's and, if any, lookup polynomials",
+        PolynomialBatch::from_values_async(
+            zs_partial_products_lookups,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+        )
+        .await
+    );
+
+    #[cfg(not(all(feature = "gpu_merkle", target_arch = "wasm32")))]
     let partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
