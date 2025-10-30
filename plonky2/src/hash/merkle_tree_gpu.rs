@@ -1465,6 +1465,24 @@ fn transpose_leaves<F: RichField>(leaves: &[Vec<F>]) -> (Vec<F>, usize) {
     (transposed, elements_per_leaf)
 }
 
+/// Computes the required workgroup sizes in x and y to produce `num` threads.
+/// We assume a workgroup size of 64!
+fn compute_workgroups(num: usize) -> (u32, u32) {
+    const WORKGROUP_SIZE: usize = 64;
+    const MAX_DIM: usize = 1 << 16; // maximum dimension of a workgroup
+                                    // we divide `maxDim` by 2 so that the max X dim is 2^15 = 32768
+    let num_blocks = (num + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+    let workgroups_y = if num_blocks >= MAX_DIM {
+        num_blocks / (MAX_DIM / 2)
+    } else {
+        1
+    };
+    let workgroups_x = (num_blocks + workgroups_y - 1) / workgroups_y;
+
+    (workgroups_x as u32, workgroups_y as u32)
+}
+
 fn hash_leaves_gpu(
     ctx: &MerkleTreeGpuContext,
     leaf_buf: Buffer,
@@ -1542,9 +1560,7 @@ fn hash_leaves_gpu(
 
     // Time dispatch
     let dispatch_start = now_ms();
-    let workgroup_size = WORKGROUP_SIZE;
-    debug_assert!(workgroup_size <= 256);
-    let workgroups_x = ((num_leaves as u32) + workgroup_size - 1) / workgroup_size;
+    let (workgroups_x, workgroups_y) = compute_workgroups(num_leaves);
 
     let mut encoder = ctx
         .device
@@ -1559,7 +1575,7 @@ fn hash_leaves_gpu(
         });
         pass.set_pipeline(&ctx.leaf_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroups_x, 1, 1);
+        pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
     }
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
@@ -1614,22 +1630,12 @@ where
     });
     // Time dispatch
     let dispatch_start = now_ms();
-    let workgroup_size = WORKGROUP_SIZE;
-    debug_assert!(workgroup_size <= 256);
-    //let workgroups_x = ((num as u32) + workgroup_size - 1) / workgroup_size;
 
-    const MAX_DIM: usize = 1 << 16; // maximum dimension of a workgroup
-                                    // we divide `maxDim` by 2 so that the max X dim is 2^15 = 32768
-    let workgroups_y = if num >= MAX_DIM {
-        num / (MAX_DIM / 2)
-    } else {
-        1
-    };
-    let num_blocks_x = (num + workgroups_y - 1) / workgroups_y;
+    let (workgroups_x, workgroups_y) = compute_workgroups(num);
 
     log::info!(
         "Starting workgroups in (x, y) : ({}, {})",
-        num_blocks_x,
+        workgroups_x,
         workgroups_y
     );
 
@@ -1647,7 +1653,7 @@ where
         pass.set_pipeline(&ctx.to_mont_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         //pass.dispatch_workgroups(workgroups_x, 1, 1);
-        pass.dispatch_workgroups(num_blocks_x as u32, workgroups_y as u32, 1);
+        pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
     }
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
@@ -1704,9 +1710,8 @@ fn montgomery_to_canonical_gpu(
 
     // Time dispatch
     let dispatch_start = now_ms();
-    let workgroup_size = WORKGROUP_SIZE;
-    debug_assert!(workgroup_size <= 256);
-    let workgroups_x = ((num as u32) + workgroup_size - 1) / workgroup_size;
+
+    let (workgroups_x, workgroups_y) = compute_workgroups(num as usize);
 
     let mut encoder = ctx
         .device
@@ -1721,7 +1726,7 @@ fn montgomery_to_canonical_gpu(
         });
         pass.set_pipeline(&ctx.to_canon_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroups_x, 1, 1);
+        pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
     }
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
@@ -1951,10 +1956,6 @@ where
             });
         let bind_time = now_ms() - bind_start;
 
-        let threads_per_block = WORKGROUP_SIZE as usize;
-        let num_blocks = (dst_layer_size + threads_per_block - 1) / threads_per_block;
-        let workgroups_x = num_blocks.max(1) as u32;
-
         // Time encoder creation and dispatch
         let encode_start = now_ms();
         let mut encoder = ctx_ref
@@ -1964,6 +1965,8 @@ where
             });
 
         log("execute layer");
+
+        let (workgroups_x, workgroups_y) = compute_workgroups(dst_layer_size);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(&format!("merkle-layer-{layer}-pass")),
@@ -1971,7 +1974,7 @@ where
             });
             pass.set_pipeline(&ctx_ref.merkle_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups_x, 1, 1);
+            pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
         let encode_time = now_ms() - encode_start;
 
