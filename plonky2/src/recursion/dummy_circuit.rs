@@ -64,6 +64,35 @@ where
     .unwrap()
 }
 
+pub async fn cyclic_base_proof_async<F, C, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    verifier_data: &VerifierOnlyCircuitData<C, D>,
+    mut nonzero_public_inputs: HashMap<usize, F>,
+) -> ProofWithPublicInputs<F, C, D>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    let pis_len = common_data.num_public_inputs;
+    let cap_elements = common_data.config.fri_config.num_cap_elements();
+    let start_vk_pis = pis_len - 4 - 4 * cap_elements;
+
+    nonzero_public_inputs.extend((start_vk_pis..).zip(verifier_data.circuit_digest.elements));
+    for i in 0..cap_elements {
+        let start = start_vk_pis + 4 + 4 * i;
+        nonzero_public_inputs
+            .extend((start..).zip(verifier_data.constants_sigmas_cap.0[i].elements));
+    }
+
+    dummy_proof_async::<F, C, D>(
+        &dummy_circuit_async::<F, C, D>(common_data).await,
+        nonzero_public_inputs,
+    )
+    .await
+    .unwrap()
+}
+
 /// Generate a proof for a dummy circuit. The `public_inputs` parameter let the caller specify
 /// certain public inputs (identified by their indices) which should be given specific values.
 /// The rest will default to zero.
@@ -79,6 +108,24 @@ where
         pw.set_target(circuit.prover_only.public_inputs[i], pi);
     }
     circuit.prove(pw)
+}
+
+pub async fn dummy_proof_async<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    circuit: &CircuitData<F, C, D>,
+    nonzero_public_inputs: HashMap<usize, F>,
+) -> anyhow::Result<ProofWithPublicInputs<F, C, D>>
+where
+{
+    let mut pw = PartialWitness::new();
+    for i in 0..circuit.common.num_public_inputs {
+        let pi = nonzero_public_inputs.get(&i).copied().unwrap_or_default();
+        pw.set_target(circuit.prover_only.public_inputs[i], pi);
+    }
+    circuit.prove_async(pw).await
 }
 
 /// Generate a circuit matching a given `CommonCircuitData`.
@@ -108,6 +155,38 @@ pub fn dummy_circuit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, c
     }
 
     let circuit = builder.build::<C>();
+    assert_eq!(&circuit.common, common_data);
+    circuit
+}
+
+pub async fn dummy_circuit_async<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+) -> CircuitData<F, C, D> {
+    let config = common_data.config.clone();
+    assert!(
+        !common_data.config.zero_knowledge,
+        "Degree calculation can be off if zero-knowledge is on."
+    );
+
+    let degree = common_data.degree();
+    let num_noop_gate = degree - common_data.num_public_inputs.div_ceil(8) - 2;
+
+    let mut builder = CircuitBuilder::<F, D>::new(config);
+    for _ in 0..num_noop_gate {
+        builder.add_gate(NoopGate, vec![]);
+    }
+    for gate in &common_data.gates {
+        builder.add_gate_to_gate_set(gate.clone());
+    }
+    for _ in 0..common_data.num_public_inputs {
+        builder.add_virtual_public_input();
+    }
+
+    let circuit = builder.build_async::<C>().await;
     assert_eq!(&circuit.common, common_data);
     circuit
 }
