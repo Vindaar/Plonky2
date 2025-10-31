@@ -201,24 +201,6 @@ fn words_to_hash<F: RichField>(words: &[u32]) -> Result<HashOut<F>> {
     Ok(HashOut { elements })
 }
 
-fn fields_to_montgomery_words<F: RichField>(values: &[F]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(values.len() * BIGINT_LIMBS);
-    for value in values {
-        out.extend_from_slice(&field_to_montgomery_words(value));
-    }
-    out
-}
-
-/// Turns a Vec<F> into a Vec<u32> of all the words in all field elements
-/// So that we can directly copy to GPU buffer
-fn fields_to_words<F: RichField>(values: &[F]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(values.len() * BIGINT_LIMBS);
-    for value in values {
-        out.extend_from_slice(&field_to_words(value));
-    }
-    out
-}
-
 fn log(msg: &str) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -1485,19 +1467,39 @@ async fn read_u32_buffer_async(
     Ok(words)
 }
 
-fn transpose_leaves<F: RichField>(leaves: &[Vec<F>]) -> (Vec<F>, usize) {
+fn transpose_leaves_to_words<F: RichField>(
+    leaves: &[Vec<F>],
+) -> Result<(Vec<u32>, usize)> {
     let num_leaves = leaves.len();
     let elements_per_leaf = leaves[0].len();
 
-    // Now transpose knowing all are elements_per_leaf long
-    let mut transposed = Vec::with_capacity(num_leaves * elements_per_leaf);
+    let total_fields = num_leaves
+        .checked_mul(elements_per_leaf)
+        .ok_or_else(|| {
+            anyhow!(
+                "leaf transposition overflow: {} leaves × {} elements",
+                num_leaves,
+                elements_per_leaf
+            )
+        })?;
+    let total_words = total_fields
+        .checked_mul(BIGINT_LIMBS)
+        .ok_or_else(|| anyhow!("leaf transposition word count overflow: {total_fields} fields"))?;
+
+    let mut words = Vec::new();
+    if let Err(err) = words.try_reserve_exact(total_words) {
+        return Err(anyhow!(
+            "failed to reserve {total_words} words for canonical leaf buffer: {err}"
+        ));
+    }
+
     for elem_idx in 0..elements_per_leaf {
         for leaf in leaves {
-            transposed.push(leaf[elem_idx]);
+            words.extend_from_slice(&field_to_words(&leaf[elem_idx]));
         }
     }
 
-    (transposed, elements_per_leaf)
+    Ok((words, elements_per_leaf))
 }
 
 /// Computes the required workgroup sizes in x and y to produce `num` threads.
@@ -1624,19 +1626,26 @@ fn hash_leaves_gpu(
 /// Converts the input buffer from canonical representation into Montgomery representation for
 /// faster further processing on the GPU.
 /// `num` is the number of field elements in the buffer.
-fn canonical_to_montgomery_gpu<F>(
+fn canonical_to_montgomery_gpu(
     ctx: &MerkleTreeGpuContext,
-    transposed: &[F],
+    canonical_words: &[u32],
     num: usize,
-) -> (Buffer, SubmissionIndex)
-where
-    F: RichField + Poseidon,
-{
+) -> Result<(Buffer, SubmissionIndex)> {
+    let expected_words = num
+        .checked_mul(BIGINT_LIMBS)
+        .ok_or_else(|| anyhow!("canonical word count overflow: {num} elements"))?;
+    ensure!(
+        canonical_words.len() == expected_words,
+        "canonical buffer length {} mismatches expected {} words",
+        canonical_words.len(),
+        expected_words
+    );
+
     let input_buffer = ctx
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("poseidon-leaf-input"),
-            contents: bytemuck::cast_slice(&fields_to_words(transposed)),
+            contents: bytemuck::cast_slice(canonical_words),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -1696,7 +1705,7 @@ where
     ctx.queue.on_submitted_work_done(|| {});
     log_timing("  Canon->Mont dispatch", now_ms() - dispatch_start);
 
-    (input_buffer, submission_index)
+    Ok((input_buffer, submission_index))
 }
 
 /// Converts the input buffer from Montgomery representation into canonical representation
@@ -1850,7 +1859,7 @@ where
 
     // Time data conversion
     let convert_start = now_ms();
-    let (transposed, elements_per_leaf) = transpose_leaves(leaves);
+    let (canonical_words, elements_per_leaf) = transpose_leaves_to_words(leaves)?;
     ensure!(
         elements_per_leaf > 0,
         "GPU Poseidon hashing received empty leaves"
@@ -1863,16 +1872,20 @@ where
 
     // TODO: Perform single canonical -> Montgomery representation pass on inputs
 
-    // Convert transposed data into Montgomery form, get buffer
-    //let transposed_words = fields_to_montgomery_words(&transposed);
+    // Convert canonical words into Montgomery form via the GPU pipeline
     let canon_to_mont_start = now_ms();
-    let (input_buffer, submission_index) =
-        canonical_to_montgomery_gpu(&ctx, &transposed, num_leaves * elements_per_leaf);
+    let (input_buffer, submission_index) = canonical_to_montgomery_gpu(
+        &ctx,
+        &canonical_words,
+        num_leaves * elements_per_leaf,
+    )?;
     last_submission_index.replace(submission_index);
     log_timing(
         "  Leaf data Canonical -> Montgomery conversion",
         now_ms() - canon_to_mont_start,
     );
+    // Release the large canonical word buffer before launching downstream GPU work.
+    drop(canonical_words);
 
     // TODO: After main Merkle tree kernel calls: single Montgomery -> canonical pass for all digsts / nodes
 
