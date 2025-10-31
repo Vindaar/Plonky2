@@ -162,6 +162,7 @@ where
 }
 
 #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
+#[track_caller]
 pub fn prove<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -176,7 +177,12 @@ where
     C::Hasher: Hasher<F>,
     C::InnerHasher: Hasher<F>,
 {
-    panic!("plonk::prover::prove must be awaited on wasm with gpu_merkle enabled; use prove_async instead");
+    let location = core::panic::Location::caller();
+    panic!(
+        "plonk::prover::prove must be awaited on wasm with gpu_merkle enabled; use prove_async instead (called from {}:{})",
+        location.file(),
+        location.line()
+    );
 }
 
 pub async fn prove_with_partition_witness_async<
