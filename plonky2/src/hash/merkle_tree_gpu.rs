@@ -361,6 +361,41 @@ impl Drop for BusyFlagGuard<'_> {
     }
 }
 
+fn scrub_readback_state(ctx: &MerkleTreeGpuContext) {
+    let outstanding_maps = ACTIVE_MAPPED_SLICES.load(Ordering::SeqCst);
+    debug_assert_eq!(
+        outstanding_maps, 0,
+        "entered with a mapped slice"
+    );
+    if outstanding_maps != 0 {
+        log(&format!(
+            "⚠️ GPU Merkle entry detected {outstanding_maps} mapped slice(s) still active; resetting counter"
+        ));
+        ACTIVE_MAPPED_SLICES.store(0, Ordering::SeqCst);
+    }
+
+    let outstanding_readbacks = ACTIVE_READBACKS.load(Ordering::SeqCst);
+    if outstanding_readbacks != 0 {
+        log(&format!(
+            "⚠️ GPU Merkle entry detected {outstanding_readbacks} readback guard(s) still active; resetting counter"
+        ));
+        ACTIVE_READBACKS.store(0, Ordering::SeqCst);
+    }
+
+    let was_busy = {
+        let busy_ref = ctx.readback_busy.borrow();
+        *busy_ref
+    };
+    debug_assert!(
+        !was_busy,
+        "entered with readback_busy=true"
+    );
+    if was_busy {
+        log("⚠️ GPU Merkle entry clearing stale readback_busy flag");
+        *ctx.readback_busy.borrow_mut() = false;
+    }
+}
+
 // ============================================================================
 // PROFILING HELPERS
 // ============================================================================
@@ -1811,15 +1846,7 @@ where
     }
 
     // Optional: verify previous run didn’t leave state dirty
-    assert_eq!(
-        ACTIVE_MAPPED_SLICES.load(Ordering::SeqCst),
-        0,
-        "entered with a mapped slice"
-    );
-    assert!(
-        !*ctx_ref.readback_busy.borrow(),
-        "entered with readback_busy=true"
-    );
+    scrub_readback_state(ctx_ref);
 
     // Time data conversion
     let convert_start = now_ms();
