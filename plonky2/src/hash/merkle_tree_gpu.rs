@@ -489,8 +489,10 @@ pub async fn initialize() -> Result<()> {
     log("Requesting device");
 
     let mut limits = wgpu::Limits::default();
-    limits.max_buffer_size = (1 << 32) - 5;
-    limits.max_storage_buffer_binding_size = (1 << 32) - 5;
+    //limits.max_buffer_size = (1 << 32) - 5;
+    //limits.max_storage_buffer_binding_size = (1 << 32) - 5;
+    limits.max_buffer_size = 1073741824;
+    limits.max_storage_buffer_binding_size = 1073741824;
 
     let (device, queue) = adapter
         .request_device(
