@@ -1,3 +1,5 @@
+requires unrestricted_pointer_parameters;
+
 @group(0) @binding(0) var<storage, read_write> output: array<P1HashDigest>;
 @group(0) @binding(1) var<storage, read_write> input: array<BigInt>;
 @group(0) @binding(2) var<storage, read> num: i32;
@@ -455,4 +457,3 @@ fn partialRoundsNaive_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_c
     (*round_ctr) = i32(((*round_ctr) + 1));
   };
 }
-

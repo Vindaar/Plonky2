@@ -1,3 +1,5 @@
+requires unrestricted_pointer_parameters;
+
 @group(0) @binding(0) var<storage, read_write> buf: array<BigInt>;
 @group(0) @binding(1) var<storage, read> num: i32;
 
