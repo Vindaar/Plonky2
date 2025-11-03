@@ -32,6 +32,7 @@ gpu_merkle = [
     "dep:console_log",
     "dep:once_cell",
 ]
+gpu_merkle_full_readback = []
 
 [dependencies]
 ahash = { workspace = true }

@@ -1,6 +1,11 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
 
+#[cfg(all(
+    feature = "std",
+    not(all(feature = "gpu_merkle", target_arch = "wasm32"))
+))]
+use futures::executor::block_on;
 use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
@@ -22,9 +27,6 @@ use crate::util::profiling::with_timer;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
-
-#[cfg(all(feature = "std", not(all(feature = "gpu_merkle", target_arch = "wasm32"))))]
-use futures::executor::block_on;
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
@@ -66,13 +68,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        let coeffs =
-            with_timer("PolynomialBatch::from_values IFFT", move || {
-                values
-                    .into_par_iter()
-                    .map(|v| v.ifft())
-                    .collect::<Vec<_>>()
-            });
+        let coeffs = with_timer("PolynomialBatch::from_values IFFT", move || {
+            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+        });
 
         Self::from_coeffs(
             coeffs,
@@ -92,13 +90,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        let coeffs =
-            with_timer("PolynomialBatch::from_values_async IFFT", move || {
-                values
-                    .into_par_iter()
-                    .map(|v| v.ifft())
-                    .collect::<Vec<_>>()
-            });
+        let coeffs = with_timer("PolynomialBatch::from_values_async IFFT", move || {
+            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+        });
 
         Self::from_coeffs_async(
             coeffs,
@@ -314,11 +308,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         #[cfg(feature = "std")]
         {
             return block_on(Self::prove_openings_async(
-                instance,
-                oracles,
-                challenger,
-                fri_params,
-                timing,
+                instance, oracles, challenger, fri_params, timing,
             ));
         }
         #[cfg(not(feature = "std"))]

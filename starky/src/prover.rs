@@ -552,21 +552,19 @@ where
         );
 
         let auxiliary_polys_commitment = if let Some(aux_polys) = auxiliary_polys {
-            Some(
-                timed!(
+            Some(timed!(
+                timing,
+                "compute auxiliary polynomials commitment",
+                PolynomialBatch::from_values_async(
+                    aux_polys,
+                    rate_bits,
+                    false,
+                    config.fri_config.cap_height,
                     timing,
-                    "compute auxiliary polynomials commitment",
-                    PolynomialBatch::from_values_async(
-                        aux_polys,
-                        rate_bits,
-                        false,
-                        config.fri_config.cap_height,
-                        timing,
-                        None,
-                    )
-                    .await
-                ),
-            )
+                    None,
+                )
+                .await
+            ))
         } else {
             None
         };
@@ -619,9 +617,9 @@ where
                 config,
             )
         );
-        let (quotient_commitment, quotient_polys_cap) =
-            if let Some(quotient_polys) = quotient_polys {
-                let all_quotient_chunks = timed!(
+        let (quotient_commitment, quotient_polys_cap) = if let Some(quotient_polys) = quotient_polys
+        {
+            let all_quotient_chunks = timed!(
                     timing,
                     "split quotient polys",
                     quotient_polys
@@ -636,25 +634,25 @@ where
                         })
                         .collect()
                 );
-                let quotient_commitment = timed!(
+            let quotient_commitment = timed!(
+                timing,
+                "compute quotient commitment",
+                PolynomialBatch::from_coeffs_async(
+                    all_quotient_chunks,
+                    rate_bits,
+                    false,
+                    config.fri_config.cap_height,
                     timing,
-                    "compute quotient commitment",
-                    PolynomialBatch::from_coeffs_async(
-                        all_quotient_chunks,
-                        rate_bits,
-                        false,
-                        config.fri_config.cap_height,
-                        timing,
-                        None,
-                    )
-                    .await
-                );
-                let quotient_polys_cap = quotient_commitment.merkle_tree.cap.clone();
-                challenger.observe_cap(&quotient_polys_cap);
-                (Some(quotient_commitment), Some(quotient_polys_cap))
-            } else {
-                (None, None)
-            };
+                    None,
+                )
+                .await
+            );
+            let quotient_polys_cap = quotient_commitment.merkle_tree.cap.clone();
+            challenger.observe_cap(&quotient_polys_cap);
+            (Some(quotient_commitment), Some(quotient_polys_cap))
+        } else {
+            (None, None)
+        };
 
         let zeta = challenger.get_extension_challenge::<D>();
         let g = F::primitive_root_of_unity(degree_bits);

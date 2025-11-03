@@ -1,6 +1,11 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+#[cfg(all(
+    feature = "std",
+    not(all(feature = "gpu_merkle", target_arch = "wasm32"))
+))]
+use futures::executor::block_on;
 use plonky2_maybe_rayon::*;
 
 use crate::field::extension::{flatten, unflatten, Extendable};
@@ -18,11 +23,12 @@ use crate::util::profiling::with_timer;
 use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
 
-#[cfg(all(feature = "std", not(all(feature = "gpu_merkle", target_arch = "wasm32"))))]
-use futures::executor::block_on;
-
 /// Builds a FRI proof asynchronously.
-pub async fn fri_proof_async<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+pub async fn fri_proof_async<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
     initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
     // Coefficients of the polynomial on which the LDT is performed. Only the first `1/rate` coefficients are non-zero.
     lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
@@ -104,7 +110,9 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     _fri_params: &FriParams,
     _timing: &mut TimingTree,
 ) -> FriProof<F, C::Hasher, D> {
-    panic!("fri_proof must be awaited on wasm with gpu_merkle enabled; call fri_proof_async instead");
+    panic!(
+        "fri_proof must be awaited on wasm with gpu_merkle enabled; call fri_proof_async instead"
+    );
 }
 
 type FriCommitedTrees<F, C, const D: usize> = (
@@ -134,11 +142,9 @@ async fn fri_committed_trees_async<
             .par_chunks(arity)
             .map(|chunk: &[F::Extension]| flatten(chunk))
             .collect();
-        let tree = MerkleTree::<F, C::Hasher>::new_async(
-            chunked_values,
-            fri_params.config.cap_height,
-        )
-        .await;
+        let tree =
+            MerkleTree::<F, C::Hasher>::new_async(chunked_values, fri_params.config.cap_height)
+                .await;
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);

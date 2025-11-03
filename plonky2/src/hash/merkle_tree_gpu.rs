@@ -9,6 +9,7 @@
 #![cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
 
 use std::cell::RefCell;
+use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::rc::Rc;
@@ -218,6 +219,10 @@ fn log_queue_submission(label: &str, index: SubmissionIndex) {
     log(&message);
 }
 
+fn full_tree_readback_enabled() -> bool {
+    cfg!(debug_assertions) || cfg!(feature = "gpu_merkle_full_readback")
+}
+
 /// Tracks in-flight readbacks to catch staging buffer leaks between Merkle trees.
 static ACTIVE_READBACKS: AtomicU32 = AtomicU32::new(0);
 /// Counts mapped slices to guarantee every `map_async` is balanced with an `unmap`.
@@ -345,10 +350,7 @@ impl Drop for BusyFlagGuard<'_> {
 
 fn scrub_readback_state(ctx: &MerkleTreeGpuContext) {
     let outstanding_maps = ACTIVE_MAPPED_SLICES.load(Ordering::SeqCst);
-    debug_assert_eq!(
-        outstanding_maps, 0,
-        "entered with a mapped slice"
-    );
+    debug_assert_eq!(outstanding_maps, 0, "entered with a mapped slice");
     if outstanding_maps != 0 {
         log(&format!(
             "⚠️ GPU Merkle entry detected {outstanding_maps} mapped slice(s) still active; resetting counter"
@@ -368,10 +370,7 @@ fn scrub_readback_state(ctx: &MerkleTreeGpuContext) {
         let busy_ref = ctx.readback_busy.borrow();
         *busy_ref
     };
-    debug_assert!(
-        !was_busy,
-        "entered with readback_busy=true"
-    );
+    debug_assert!(!was_busy, "entered with readback_busy=true");
     if was_busy {
         log("⚠️ GPU Merkle entry clearing stale readback_busy flag");
         *ctx.readback_busy.borrow_mut() = false;
@@ -977,6 +976,58 @@ struct MerkleBuffers {
     cap: Buffer,
 }
 
+struct QueueCompletion {
+    receiver: oneshot::Receiver<()>,
+    callback_fired: Arc<AtomicBool>,
+    sender_holder: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl QueueCompletion {
+    fn new(queue: Rc<Queue>) -> Self {
+        let (sender, receiver) = oneshot::channel();
+        let callback_fired = Arc::new(AtomicBool::new(false));
+        let sender_holder = Arc::new(Mutex::new(Some(sender)));
+        let callback_flag = Arc::clone(&callback_fired);
+        let sender_holder_cb = Arc::clone(&sender_holder);
+        queue.on_submitted_work_done(move || {
+            log("wait_for_queue -> on_submitted_work_done invoked");
+            callback_flag.store(true, Ordering::SeqCst);
+            if let Ok(mut guard) = sender_holder_cb.lock() {
+                if let Some(tx) = guard.take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+
+        Self {
+            receiver,
+            callback_fired,
+            sender_holder,
+        }
+    }
+
+    fn split(
+        self,
+    ) -> (
+        oneshot::Receiver<()>,
+        Arc<AtomicBool>,
+        Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    ) {
+        (self.receiver, self.callback_fired, self.sender_holder)
+    }
+}
+
+impl fmt::Debug for QueueCompletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QueueCompletion")
+            .field(
+                "callback_fired",
+                &self.callback_fired.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 enum MerkleGpuJobState<F: RichField> {
     Immediate(GpuMerkleOutput<F>),
@@ -988,7 +1039,7 @@ enum MerkleGpuJobState<F: RichField> {
         num_leaves: usize,
         cap_height: usize,
         num_layers_to_cap: usize,
-        last_submission: Option<SubmissionIndex>,
+        queue_completion: Option<QueueCompletion>,
     },
 }
 
@@ -1017,7 +1068,7 @@ where
         num_leaves: usize,
         cap_height: usize,
         num_layers_to_cap: usize,
-        last_submission: Option<SubmissionIndex>,
+        queue_completion: Option<QueueCompletion>,
     ) -> Self {
         Self {
             state: MerkleGpuJobState::Deferred {
@@ -1028,7 +1079,7 @@ where
                 num_leaves,
                 cap_height,
                 num_layers_to_cap,
-                last_submission,
+                queue_completion,
             },
             _marker: PhantomData,
         }
@@ -1045,16 +1096,14 @@ where
                 num_leaves,
                 cap_height,
                 num_layers_to_cap,
-                last_submission,
+                queue_completion,
             } => {
                 console::log_1(&"=== PHASE 4: GPU Completion & Readback ===".into());
-                if let Some(index) = &last_submission {
-                    log(&format!(
-                        "wait_for_queue expecting latest submission index: {index:?}"
-                    ));
+                log(if queue_completion.is_some() {
+                    "wait_for_queue will await queued completion callback"
                 } else {
-                    log("wait_for_queue expects submission index: <none recorded>");
-                }
+                    "wait_for_queue has no completion callback recorded"
+                });
                 let readback_start = now_ms();
 
                 // Wait for GPU to finish
@@ -1062,99 +1111,127 @@ where
                 wait_for_queue(
                     context.device.clone(),
                     context.queue.clone(),
-                    last_submission.clone(),
+                    queue_completion,
                 )
                 .await?;
                 log_timing("⚡ GPU execution (wait_for_queue)", now_ms() - wait_start);
 
-                // Read leaf hashes
-                let leaf_read_start = now_ms();
-                let leaf_words =
-                    read_u32_buffer_async(&context, &buffers.input, num_leaves * WORDS_PER_DIGEST)
-                        .await?;
-                log_timing("Leaf hash readback", now_ms() - leaf_read_start);
+                let full_tree_readback = full_tree_readback_enabled();
+                if !full_tree_readback {
+                    log("Full tree readback disabled; skipping leaf/node staging copies (cap-only mode)");
+                }
 
-                let leaf_convert_start = now_ms();
-                let leaf_hashes: Vec<HashOut<F>> = leaf_words
-                    .chunks(WORDS_PER_DIGEST)
-                    .map(words_to_hash::<F>)
-                    .collect::<Result<Vec<_>>>()?;
-                log_timing("Leaf canonical decode", now_ms() - leaf_convert_start);
+                let mut leaf_hashes: Vec<HashOut<F>> = Vec::new();
+                let mut node_hashes: Vec<HashOut<F>> = Vec::new();
 
-                // Read node hashes
-                let node_read_start = now_ms();
-                let node_hashes: Vec<HashOut<F>> = if total_nodes > 0 {
-                    let node_words = read_u32_buffer_async(
+                if full_tree_readback {
+                    // Read leaf hashes
+                    let leaf_read_start = now_ms();
+                    let (hashes, leaf_convert_ms) = map_u32_buffer_async(
                         &context,
-                        &buffers.nodes,
-                        total_nodes * WORDS_PER_DIGEST,
+                        &buffers.input,
+                        num_leaves * WORDS_PER_DIGEST,
+                        |words| {
+                            let convert_start = now_ms();
+                            let hashes = words
+                                .chunks(WORDS_PER_DIGEST)
+                                .map(words_to_hash::<F>)
+                                .collect::<Result<Vec<_>>>()?;
+                            Ok((hashes, now_ms() - convert_start))
+                        },
                     )
                     .await?;
-                    log_timing("Node hash readback", now_ms() - node_read_start);
+                    let leaf_total_ms = now_ms() - leaf_read_start;
+                    let leaf_readback_ms = (leaf_total_ms - leaf_convert_ms).max(0.0);
+                    log_timing("Leaf hash readback", leaf_readback_ms);
+                    log_timing("Leaf canonical decode", leaf_convert_ms);
+                    leaf_hashes = hashes;
 
-                    let convert_start = now_ms();
-                    let result = node_words
-                        .chunks(WORDS_PER_DIGEST)
-                        .map(words_to_hash::<F>)
-                        .collect::<Result<Vec<_>>>()?;
-                    log_timing("Node canonical decode", now_ms() - convert_start);
-                    result
-                } else {
-                    Vec::new()
-                };
-
-                // Read cap
-                let cap_read_start = now_ms();
-                let cap_words =
-                    read_u32_buffer_async(&context, &buffers.cap, cap_len * WORDS_PER_DIGEST)
+                    // Read node hashes
+                    if total_nodes > 0 {
+                        let node_read_start = now_ms();
+                        let (hashes, node_convert_ms) = map_u32_buffer_async(
+                            &context,
+                            &buffers.nodes,
+                            total_nodes * WORDS_PER_DIGEST,
+                            |words| {
+                                let convert_start = now_ms();
+                                let hashes = words
+                                    .chunks(WORDS_PER_DIGEST)
+                                    .map(words_to_hash::<F>)
+                                    .collect::<Result<Vec<_>>>()?;
+                                Ok((hashes, now_ms() - convert_start))
+                            },
+                        )
                         .await?;
-                log_timing("Cap readback", now_ms() - cap_read_start);
-
-                let cap_convert_start = now_ms();
-                let cap_hashes: Vec<HashOut<F>> = cap_words
-                    .chunks(WORDS_PER_DIGEST)
-                    .map(words_to_hash::<F>)
-                    .collect::<Result<Vec<_>>>()?;
-                log_timing("Cap canonical decode", now_ms() - cap_convert_start);
-
-                // CPU post-processing: reconstruct digest tree
-                console::log_1(&"=== PHASE 5: CPU Post-processing ===".into());
-                let postprocess_start = now_ms();
-
-                let num_digests = 2 * (num_leaves - (1 << cap_height));
-                let mut digests = if num_digests == 0 {
-                    Vec::new()
-                } else {
-                    vec![HashOut::<F>::ZERO; num_digests]
-                };
-
-                if num_digests > 0 {
-                    let accessor = LayerAccessor::new(
-                        &leaf_hashes,
-                        &node_hashes,
-                        &cap_hashes,
-                        num_leaves,
-                        num_layers_to_cap,
-                    );
-                    let subtree_digests_len = num_digests >> cap_height;
-                    let subtree_leaves_len = num_leaves >> cap_height;
-
-                    log("Subtree business");
-                    for (subtree_idx, subtree_buf) in
-                        digests.chunks_mut(subtree_digests_len).enumerate()
-                    {
-                        let leaf_offset = subtree_idx * subtree_leaves_len;
-                        let root_digest = fill_subtree_from_gpu(
-                            subtree_buf,
-                            &accessor,
-                            leaf_offset,
-                            subtree_leaves_len,
-                        );
-                        debug_assert_eq!(root_digest, cap_hashes[subtree_idx]);
+                        let node_total_ms = now_ms() - node_read_start;
+                        let node_readback_ms = (node_total_ms - node_convert_ms).max(0.0);
+                        log_timing("Node hash readback", node_readback_ms);
+                        log_timing("Node canonical decode", node_convert_ms);
+                        node_hashes = hashes;
                     }
                 }
 
-                log_timing("Digest tree reconstruction", now_ms() - postprocess_start);
+                // Read cap
+                let cap_read_start = now_ms();
+                let (cap_hashes, cap_convert_ms) = map_u32_buffer_async(
+                    &context,
+                    &buffers.cap,
+                    cap_len * WORDS_PER_DIGEST,
+                    |words| {
+                        let convert_start = now_ms();
+                        let hashes = words
+                            .chunks(WORDS_PER_DIGEST)
+                            .map(words_to_hash::<F>)
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok((hashes, now_ms() - convert_start))
+                    },
+                )
+                .await?;
+                let cap_total_ms = now_ms() - cap_read_start;
+                let cap_readback_ms = (cap_total_ms - cap_convert_ms).max(0.0);
+                log_timing("Cap readback", cap_readback_ms);
+                log_timing("Cap canonical decode", cap_convert_ms);
+
+                // CPU post-processing: reconstruct digest tree if requested
+                let mut digests = Vec::new();
+                if full_tree_readback {
+                    console::log_1(&"=== PHASE 5: CPU Post-processing ===".into());
+                    let postprocess_start = now_ms();
+
+                    let num_digests = 2 * (num_leaves - (1 << cap_height));
+                    if num_digests > 0 {
+                        digests = vec![HashOut::<F>::ZERO; num_digests];
+                        let accessor = LayerAccessor::new(
+                            &leaf_hashes,
+                            &node_hashes,
+                            &cap_hashes,
+                            num_leaves,
+                            num_layers_to_cap,
+                        );
+                        let subtree_digests_len = num_digests >> cap_height;
+                        let subtree_leaves_len = num_leaves >> cap_height;
+
+                        log("Subtree business");
+                        for (subtree_idx, subtree_buf) in
+                            digests.chunks_mut(subtree_digests_len).enumerate()
+                        {
+                            let leaf_offset = subtree_idx * subtree_leaves_len;
+                            let root_digest = fill_subtree_from_gpu(
+                                subtree_buf,
+                                &accessor,
+                                leaf_offset,
+                                subtree_leaves_len,
+                            );
+                            debug_assert_eq!(root_digest, cap_hashes[subtree_idx]);
+                        }
+                    }
+
+                    log_timing("Digest tree reconstruction", now_ms() - postprocess_start);
+                } else {
+                    log("Digest reconstruction skipped (cap-only mode)");
+                }
+
                 log_timing(
                     "📥 TOTAL READBACK + POST-PROCESSING",
                     now_ms() - readback_start,
@@ -1211,74 +1288,67 @@ fn create_buffers(
 
 async fn wait_for_queue(
     device: Rc<Device>,
-    queue: Rc<Queue>,
-    expected_submission: Option<SubmissionIndex>,
+    _queue: Rc<Queue>,
+    queue_completion: Option<QueueCompletion>,
 ) -> Result<()> {
-    if let Some(index) = &expected_submission {
-        log(&format!(
-            "wait_for_queue -> start (expected submission index: {index:?})"
-        ));
+    if queue_completion.is_some() {
+        log("wait_for_queue -> start (completion callback registered)");
     } else {
-        log("wait_for_queue -> start (no submission index recorded)");
+        log("wait_for_queue -> start (no completion callback; falling back to poll)");
     }
 
-    let poll_target = expected_submission.clone();
+    let (receiver_opt, callback_flag_opt, sender_holder_opt) = match queue_completion {
+        Some(completion) => {
+            let (receiver, callback_flag, sender_holder) = completion.split();
+            (Some(receiver), Some(callback_flag), Some(sender_holder))
+        }
+        None => (None, None, None),
+    };
 
-    let (sender, receiver) = oneshot::channel::<()>();
-    let sender_holder = Arc::new(Mutex::new(Some(sender)));
-    let callback_flag = Arc::new(AtomicBool::new(false));
-    {
-        let callback_flag = Arc::clone(&callback_flag);
-        let sender_holder = Arc::clone(&sender_holder);
-        queue.on_submitted_work_done(move || {
-            log("wait_for_queue -> on_submitted_work_done invoked");
-            callback_flag.store(true, Ordering::SeqCst);
-            if let Ok(mut guard) = sender_holder.lock() {
-                if let Some(tx) = guard.take() {
-                    let _ = tx.send(());
-                }
-            }
-        });
-    }
+    let mut receiver = receiver_opt.map(|rx| rx.fuse());
+    let callback_flag_for_log = callback_flag_opt.as_ref().map(Arc::clone);
+    let callback_flag_poll = callback_flag_opt.as_ref().map(Arc::clone);
+    let sender_holder_poll = sender_holder_opt.as_ref().map(Arc::clone);
 
-    let mut receiver = receiver.fuse();
     let mut polls: u64 = 0;
-    let callback_flag_poll = Arc::clone(&callback_flag);
-    let sender_holder_poll = Arc::clone(&sender_holder);
     poll_fn(move |cx| {
         polls += 1;
-        let poll_type = poll_target
-            .clone()
-            .map_or(wgpu::PollType::Poll, wgpu::PollType::WaitForSubmissionIndex);
-        let poll_result = device.poll(poll_type);
+        let poll_result = device.poll(wgpu::PollType::Poll);
 
         if polls == 1 {
             log(&format!(
                 "wait_for_queue poll[1]: poll_result={:?}, callback_fired={}",
                 poll_result,
-                callback_flag_poll.load(Ordering::Relaxed)
+                callback_flag_poll
+                    .as_ref()
+                    .map(|flag| flag.load(Ordering::Relaxed))
+                    .unwrap_or(false)
             ));
         } else if polls % 500 == 0 {
             log(&format!(
                 "wait_for_queue poll[{polls}]: poll_result={:?}, callback_fired={}",
                 poll_result,
-                callback_flag_poll.load(Ordering::Relaxed)
+                callback_flag_poll
+                    .as_ref()
+                    .map(|flag| flag.load(Ordering::Relaxed))
+                    .unwrap_or(false)
             ));
         }
+
+        let mut completed_via_poll = false;
 
         match poll_result {
             Ok(status) => {
                 if status.wait_finished() {
-                    let already = callback_flag_poll.swap(true, Ordering::SeqCst);
-                    if !already {
-                        log(&format!(
-                            "wait_for_queue -> poll observed completion with status={status:?}"
-                        ));
-                        if let Ok(mut guard) = sender_holder_poll.lock() {
-                            if let Some(tx) = guard.take() {
-                                let _ = tx.send(());
-                            }
+                    if let Some(flag) = callback_flag_poll.as_ref() {
+                        // Callback owns completion; polling keeps the device progressing.
+                        if !flag.load(Ordering::Relaxed) && polls == 1 {
+                            log(&format!(
+                                "wait_for_queue -> poll saw wait_finished (status={status:?}); awaiting callback-driven completion"
+                            ));
                         }
+                    } else {
+                        completed_via_poll = true;
                     }
                 }
             }
@@ -1286,46 +1356,74 @@ async fn wait_for_queue(
                 log(&format!(
                     "wait_for_queue -> device.poll reported error: {err:?}"
                 ));
-                if let Ok(mut guard) = sender_holder_poll.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(());
+                if let Some(holder) = sender_holder_poll.as_ref() {
+                    if let Ok(mut guard) = holder.lock() {
+                        if let Some(tx) = guard.take() {
+                            let _ = tx.send(());
+                        }
                     }
                 }
                 return std::task::Poll::Ready(Err(anyhow!("device.poll returned error: {err:?}")));
             }
         }
 
-        match receiver.poll_unpin(cx) {
-            std::task::Poll::Ready(res) => {
-                if !callback_flag_poll.load(Ordering::Relaxed) {
-                    log("wait_for_queue -> receiver ready before callback flag set");
+        if completed_via_poll {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        if let Some(ref mut rx) = receiver {
+            match rx.poll_unpin(cx) {
+                std::task::Poll::Ready(res) => {
+                    if let Some(flag) = callback_flag_poll.as_ref() {
+                        if !flag.load(Ordering::Relaxed) {
+                            log("wait_for_queue -> receiver ready before callback flag set");
+                        }
+                    }
+                    return std::task::Poll::Ready(
+                        res.map_err(|_| anyhow!("queue completion receiver dropped (oneshot)")),
+                    );
                 }
-                std::task::Poll::Ready(
-                    res.map_err(|_| anyhow!("queue completion receiver dropped (oneshot)")),
-                )
+                std::task::Poll::Pending => {
+                    if polls % 2000 == 0 {
+                        log("wait_for_queue -> still pending (awaiting callback)");
+                    }
+                }
             }
-            std::task::Poll::Pending => {
-                if polls % 2000 == 0 {
-                    log("wait_for_queue -> still pending (awaiting callback)");
-                }
-                std::task::Poll::Pending
+        } else if let Some(flag) = callback_flag_poll.as_ref() {
+            if flag.load(Ordering::Relaxed) {
+                return std::task::Poll::Ready(Ok(()));
             }
         }
+
+        if polls == 1 || polls % 64 == 0 {
+            let waker = cx.waker().clone();
+            spawn_local(async move {
+                yield_to_event_loop().await;
+                waker.wake();
+            });
+        }
+        std::task::Poll::Pending
     })
     .await?;
 
     log(&format!(
         "wait_for_queue -> completed after {polls} polls (callback_fired={})",
-        callback_flag.load(Ordering::Relaxed)
+        callback_flag_for_log
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
     ));
     Ok(())
 }
 
-async fn read_u32_buffer_async(
+async fn map_u32_buffer_async<T, F>(
     context: &MerkleTreeGpuContext,
     buffer: &wgpu::Buffer,
     word_len: usize,
-) -> Result<Vec<u32>> {
+    process: F,
+) -> Result<T>
+where
+    F: FnOnce(&[u32]) -> Result<T>,
+{
     {
         let mut busy = context.readback_busy.borrow_mut();
         if *busy {
@@ -1456,34 +1554,43 @@ async fn read_u32_buffer_async(
         word_len,
         "{label} mapped words != expected word_len"
     );
-    let words: Vec<u32> = words_slice.to_vec();
+    let process_result = process(words_slice);
     drop(data);
     staging.unmap();
-    map_guard.release("success");
-    readback_guard.release("success");
-    drop(busy_guard);
-    // 🔸 Yield here: give the event loop a turn before the next readback starts
-    yield_to_event_loop().await;
 
-    log(&format!("{label} completed successfully"));
-    Ok(words)
+    match process_result {
+        Ok(value) => {
+            map_guard.release("success");
+            readback_guard.release("success");
+            drop(busy_guard);
+            // 🔸 Yield here: give the event loop a turn before the next readback starts
+            yield_to_event_loop().await;
+
+            log(&format!("{label} completed successfully"));
+            Ok(value)
+        }
+        Err(err) => {
+            map_guard.release("processor error");
+            readback_guard.release("processor error");
+            drop(busy_guard);
+            yield_to_event_loop().await;
+            log(&format!("{label} processor failed: {err:?}"));
+            Err(err)
+        }
+    }
 }
 
-fn transpose_leaves_to_words<F: RichField>(
-    leaves: &[Vec<F>],
-) -> Result<(Vec<u32>, usize)> {
+fn transpose_leaves_to_words<F: RichField>(leaves: &[Vec<F>]) -> Result<(Vec<u32>, usize)> {
     let num_leaves = leaves.len();
     let elements_per_leaf = leaves[0].len();
 
-    let total_fields = num_leaves
-        .checked_mul(elements_per_leaf)
-        .ok_or_else(|| {
-            anyhow!(
-                "leaf transposition overflow: {} leaves × {} elements",
-                num_leaves,
-                elements_per_leaf
-            )
-        })?;
+    let total_fields = num_leaves.checked_mul(elements_per_leaf).ok_or_else(|| {
+        anyhow!(
+            "leaf transposition overflow: {} leaves × {} elements",
+            num_leaves,
+            elements_per_leaf
+        )
+    })?;
     let total_words = total_fields
         .checked_mul(BIGINT_LIMBS)
         .ok_or_else(|| anyhow!("leaf transposition word count overflow: {total_fields} fields"))?;
@@ -1619,7 +1726,6 @@ fn hash_leaves_gpu(
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
     log_queue_submission("hash_leaves_gpu", submission_index.clone());
-    ctx.queue.on_submitted_work_done(|| {});
     log_timing("  Leaf dispatch", now_ms() - dispatch_start);
 
     Ok((output_buffer, submission_index))
@@ -1704,7 +1810,6 @@ fn canonical_to_montgomery_gpu(
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
     log_queue_submission("canonical_to_montgomery_gpu", submission_index.clone());
-    ctx.queue.on_submitted_work_done(|| {});
     log_timing("  Canon->Mont dispatch", now_ms() - dispatch_start);
 
     Ok((input_buffer, submission_index))
@@ -1777,7 +1882,6 @@ fn montgomery_to_canonical_gpu(
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
     log_queue_submission("montgomery_to_canonical_gpu", submission_index.clone());
-    ctx.queue.on_submitted_work_done(|| {});
     log_timing("  Mont->Canon dispatch", now_ms() - dispatch_start);
 
     Some(submission_index)
@@ -1805,7 +1909,7 @@ where
     let total_start = now_ms();
 
     let ctx_ref = ctx.as_ref();
-    let mut last_submission_index: Option<SubmissionIndex> = None;
+    let mut saw_submission = false;
 
     let (num_leaves, elements_per_leaf) = leaf_info(leaves);
     let config_msg = format!(
@@ -1876,12 +1980,11 @@ where
 
     // Convert canonical words into Montgomery form via the GPU pipeline
     let canon_to_mont_start = now_ms();
-    let (input_buffer, submission_index) = canonical_to_montgomery_gpu(
-        &ctx,
-        &canonical_words,
-        num_leaves * elements_per_leaf,
-    )?;
-    last_submission_index.replace(submission_index);
+    let (input_buffer, _submission_index) =
+        canonical_to_montgomery_gpu(&ctx, &canonical_words, num_leaves * elements_per_leaf)?;
+    if !saw_submission {
+        saw_submission = true;
+    }
     log_timing(
         "  Leaf data Canonical -> Montgomery conversion",
         now_ms() - canon_to_mont_start,
@@ -1895,9 +1998,11 @@ where
     console::log_1(&"=== PHASE 1: Leaf Hashing ===".into());
     let leaf_start = now_ms();
     log("launching GPU Poseidon hashing");
-    let (leaf_buffer, submission_index) =
+    let (leaf_buffer, _submission_index) =
         hash_leaves_gpu(ctx_ref, input_buffer, num_leaves, elements_per_leaf)?;
-    last_submission_index.replace(submission_index);
+    if !saw_submission {
+        saw_submission = true;
+    }
     log("queued GPU Poseidon hashing");
     log_timing("Leaf hash setup + dispatch", now_ms() - leaf_start);
 
@@ -2024,8 +2129,9 @@ where
         let submit_start = now_ms();
         let submission_index = ctx_ref.queue.submit(Some(encoder.finish()));
         log_queue_submission(&format!("merkle_layer_{layer}"), submission_index.clone());
-        ctx_ref.queue.on_submitted_work_done(|| {});
-        last_submission_index.replace(submission_index);
+        if !saw_submission {
+            saw_submission = true;
+        }
         let submit_time = now_ms() - submit_start;
 
         let layer_time = now_ms() - layer_start;
@@ -2039,19 +2145,27 @@ where
     }
 
     // Convert input buffer (leaf nodes) from Montgomery into canonical repr
-    if let Some(submission_index) = montgomery_to_canonical_gpu(
+    if montgomery_to_canonical_gpu(
         ctx_ref,
         &buffers.input,
         (num_leaves * NUM_HASH_OUT_ELTS) as u32,
-    ) {
-        last_submission_index.replace(submission_index);
+    )
+    .is_some()
+    {
+        if !saw_submission {
+            saw_submission = true;
+        }
     }
-    if let Some(submission_index) = montgomery_to_canonical_gpu(
+    if montgomery_to_canonical_gpu(
         ctx_ref,
         &buffers.nodes,
         (total_nodes * NUM_HASH_OUT_ELTS) as u32,
-    ) {
-        last_submission_index.replace(submission_index);
+    )
+    .is_some()
+    {
+        if !saw_submission {
+            saw_submission = true;
+        }
     }
 
     let total_layer_time = now_ms() - layer_setup_start;
@@ -2065,9 +2179,15 @@ where
         total_setup_time,
     );
 
-    if last_submission_index.is_none() {
+    if !saw_submission {
         log("Merkle GPU pipeline recorded no queue submissions before wait (unexpected)");
     }
+
+    let queue_completion = if saw_submission {
+        Some(QueueCompletion::new(ctx.queue.clone()))
+    } else {
+        None
+    };
 
     Ok(MerkleGpuJob::deferred(
         ctx,
@@ -2077,7 +2197,7 @@ where
         num_leaves,
         cap_height,
         num_layers_to_cap,
-        last_submission_index,
+        queue_completion,
     ))
 }
 

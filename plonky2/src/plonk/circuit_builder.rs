@@ -1593,8 +1593,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         }
 
         #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
-        self.try_build_with_options_wasm::<C>(commit_to_sigma)
-            .await
+        self.try_build_with_options_wasm::<C>(commit_to_sigma).await
     }
 
     pub async fn build_with_options_async<C: GenericConfig<D, F = F>>(
@@ -1608,9 +1607,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
         {
-            let (circuit_data, success) = self
-                .try_build_with_options_wasm::<C>(commit_to_sigma)
-                .await;
+            let (circuit_data, success) =
+                self.try_build_with_options_wasm::<C>(commit_to_sigma).await;
             if !success {
                 panic!("Failed to build circuit");
             }

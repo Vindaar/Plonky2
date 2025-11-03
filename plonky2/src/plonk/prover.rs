@@ -6,6 +6,11 @@ use core::cmp::min;
 use core::mem::swap;
 
 use anyhow::{ensure, Result};
+#[cfg(all(
+    feature = "std",
+    not(all(feature = "gpu_merkle", target_arch = "wasm32"))
+))]
+use futures::executor::block_on;
 use hashbrown::HashMap;
 use plonky2_maybe_rayon::*;
 
@@ -35,9 +40,6 @@ use crate::util::partial_products::{partial_products_and_z_gx, quotient_chunk_pr
 use crate::util::profiling::with_timer;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil, transpose};
-
-#[cfg(all(feature = "std", not(all(feature = "gpu_merkle", target_arch = "wasm32"))))]
-use futures::executor::block_on;
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -113,11 +115,7 @@ pub fn set_lookup_wires<
     }
 }
 
-pub async fn prove_async<
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    const D: usize,
->(
+pub async fn prove_async<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
     inputs: PartialWitness<F>,
@@ -137,11 +135,7 @@ where
 }
 
 #[cfg(not(all(feature = "gpu_merkle", target_arch = "wasm32")))]
-pub fn prove<
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    const D: usize,
->(
+pub fn prove<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
     inputs: PartialWitness<F>,
@@ -163,11 +157,7 @@ where
 
 #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
 #[track_caller]
-pub fn prove<
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    const D: usize,
->(
+pub fn prove<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     _prover_data: &ProverOnlyCircuitData<F, C, D>,
     _common_data: &CommonCircuitData<F, D>,
     _inputs: PartialWitness<F>,
