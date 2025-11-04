@@ -205,6 +205,7 @@ fn words_to_hash<F: RichField>(words: &[u32]) -> Result<HashOut<F>> {
 fn log(msg: &str) {
     #[cfg(target_arch = "wasm32")]
     {
+        #[cfg(feature = "gpu_merkle_logging")]
         web_sys::console::log_1(&msg.into());
     }
 
