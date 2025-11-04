@@ -143,6 +143,31 @@ fn build_merkle_tree(
     tree
 }
 
+#[cfg(feature = "gpu_merkle")]
+fn build_merkle_tree_async(
+    leaves: Vec<Vec<GoldilocksField>>,
+    cap_height: usize,
+) -> MerkleTree<GoldilocksField, PoseidonHash> {
+    println!(
+        "\nBuilding Merkle tree asynchronously (GPU path) with cap_height = {}...",
+        cap_height
+    );
+    let tree_start = Instant::now();
+    let tree = futures::executor::block_on(MerkleTree::<GoldilocksField, PoseidonHash>::new_async(
+        leaves, cap_height,
+    ));
+    let tree_duration = tree_start.elapsed();
+
+    println!(
+        "✓ Async Merkle tree construction complete in {:.2?}",
+        tree_duration
+    );
+    println!("  - Tree has {} internal digests", tree.digests.len());
+    println!("  - Cap has {} elements", tree.cap.0.len());
+
+    tree
+}
+
 fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUninit<T>] {
     assert!(v.capacity() >= len);
     let v_ptr = v.as_mut_ptr().cast::<MaybeUninit<T>>();
@@ -192,23 +217,48 @@ fn main() {
     println!("\n✓ Hash leaves execution time: {:.2?}", hash_duration);
 
     // Build Merkle tree with cap height 0 (single root)
-    println!("Step 3: Building Merkle tree...");
+    println!("Step 3: Building Merkle tree (CPU)...");
     let cap_height = 4;
-    let tree = build_merkle_tree(leaves, cap_height);
+    let cpu_tree = build_merkle_tree(leaves.clone(), cap_height);
+
+    #[cfg(feature = "gpu_merkle")]
+    let gpu_tree = {
+        println!("Step 4: Building Merkle tree (GPU async path)...");
+        build_merkle_tree_async(leaves, cap_height)
+    };
 
     // Display root hash
-    println!("\n=== Results ===");
-    let root = &tree.cap.0[0];
-    let root_elements: Vec<String> = root
+    println!("\n=== CPU Results ===");
+    let cpu_root = &cpu_tree.cap.0[0];
+    let cpu_root_elements: Vec<String> = cpu_root
         .to_vec()
         .iter()
         .map(|x| x.to_canonical_u64().to_string())
         .collect();
 
-    println!("Root hash: [{}]", root_elements.join(", "));
+    println!("Root hash: [{}]", cpu_root_elements.join(", "));
     println!("\nTotal leaves: {}", num_leaves);
-    println!("Internal digests: {}", tree.digests.len());
+    println!("Internal digests: {}", cpu_tree.digests.len());
     println!("Cap height: {}", cap_height);
+
+    #[cfg(feature = "gpu_merkle")]
+    {
+        println!("\n=== GPU Results ===");
+        let gpu_root = &gpu_tree.cap.0[0];
+        let gpu_root_elements: Vec<String> = gpu_root
+            .to_vec()
+            .iter()
+            .map(|x| x.to_canonical_u64().to_string())
+            .collect();
+        println!("Root hash: [{}]", gpu_root_elements.join(", "));
+        println!("Internal digests: {}", gpu_tree.digests.len());
+        println!("Cap height: {}", cap_height);
+        if gpu_tree.cap.0 == cpu_tree.cap.0 {
+            println!("GPU root matches CPU root");
+        } else {
+            println!("WARNING: GPU root differs from CPU root");
+        }
+    }
 
     let total_duration = total_start.elapsed();
     println!("\n✓ Total execution time: {:.2?}", total_duration);
