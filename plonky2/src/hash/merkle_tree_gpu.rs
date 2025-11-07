@@ -862,10 +862,10 @@ fn create_transpose_to_mont_bind_group_layout(device: &Device) -> BindGroupLayou
             },
             // 1: input buffer to transpose & convert
             wgpu::BindGroupLayoutEntry {
-                binding: 0,
+                binding: 1,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false,
                     min_binding_size: NonZeroU64::new(BYTES_PER_BIGINT as u64),
                 },
@@ -1697,7 +1697,7 @@ fn send_chunk_data<F: RichField>(ctx: &MerkleTreeGpuContext, leaves: &[Vec<F>]) 
     let mut dst = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("merkle-send-chunks"),
         size,
-        usage: wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let mut i = 0;
@@ -1770,6 +1770,8 @@ fn send_chunk_data<F: RichField>(ctx: &MerkleTreeGpuContext, leaves: &[Vec<F>]) 
             // You could bail or fall back to a reusable Vec<u32> + write_buffer here.
             panic!("write_buffer_with failed validation");
         }
+
+        i += upto;
         //for j in 0..upto {
         //    let dst_off = j * (2 * elems_per_leaf);
         //    let src = data[start + j];
