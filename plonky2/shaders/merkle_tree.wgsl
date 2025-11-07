@@ -1,6 +1,4 @@
-requires unrestricted_pointer_parameters;
-
-@group(0) @binding(0) var<storage, read> input: array<Input>;
+@group(0) @binding(0) var<storage, read_write> input: array<P1HashDigest>;
 @group(0) @binding(1) var<storage, read_write> nodes: array<P1HashDigest>;
 @group(0) @binding(2) var<storage, read_write> cap: array<P1HashDigest>;
 @group(0) @binding(3) var<storage, read> args: MerkleTreeKernelArgs;
@@ -8,13 +6,14 @@ requires unrestricted_pointer_parameters;
 @group(0) @binding(5) var<storage, read> mdsDiag: array<BigInt, 12>;
 @group(0) @binding(6) var<storage, read> rc: array<BigInt, 360>;
 
+const WORKGROUP_SIZE: u32 = 64u;
+const WORKGROUP_SIZE_Y: u32 = 1u;
 var<private> carry_flag: u32 = 0u;
 const M: BigInt = BigInt(array(u32(1), u32(4294967295)));
 const MontyOne: BigInt = BigInt(array(u32(4294967295), u32(0)));
 const PP1D2: BigInt = BigInt(array(u32(2147483649), u32(2147483647)));
 const M0NInv: u32 = 4294967295;
 const R2modP: BigInt = BigInt(array(u32(1), u32(4294967294)));
-const WORKGROUP_SIZE: i32 = 64;
 
 struct BigInt {
   limbs: array<u32, 2>,
@@ -22,38 +21,101 @@ struct BigInt {
 struct P1HashDigest {
   elems: array<BigInt, 4>,
 };
-struct Input {
-  elems: array<BigInt, 4>,
-};
 struct MerkleTreeKernelArgs {
-  capLen: i32,
-  layer: i32,
-  srcLayerSize: i32,
-  dstLayerSize: i32,
-  srcOffset: i32,
-  dstOffset: i32,
+  capLen: u32,
+  layer: u32,
+  srcLayerSize: u32,
+  dstLayerSize: u32,
+  srcOffset: u32,
+  dstOffset: u32,
   writeToCap: i32,
 };
 
-@compute @workgroup_size(WORKGROUP_SIZE)
-fn processMerkleTreeLayerWithCap(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
+@compute @workgroup_size(WORKGROUP_SIZE, WORKGROUP_SIZE_Y)
+fn processMerkleTreeLayerWithCap(@builtin(local_invocation_id)  local_id : vec3<u32>,      // ≈ CUDA threadIdx
+@builtin(workgroup_id)         workgroup_id: vec3<u32>,   // ≈ CUDA blockIdx
+@builtin(num_workgroups)       num_workgroups: vec3<u32>, // ≈ CUDA gridDim
+@builtin(global_invocation_id) global_id: vec3<u32>,      // = workgroup_id * workgroup_size + local_id
+) {
   /* Process a single layer of the Merkle tree with cap support using
-the layer-based storage layout shared with the proof generator. */;
+the layer-based storage layout shared with the proof generator.
+
+TODO: In theory there's no reason to differentiate between the cap and
+the nodes. The cap is just the last N nodes. We can precompute the indices
+at which the cap is located and handle copying back the correct nodes
+as part of the Nim (CPU) routine that copies the results back. */;
   let grid_width: u32 = (num_workgroups.x * 64u);
-  let tid: i32 = ((i32(global_id.y) * i32(grid_width)) + i32(global_id.x));
+  let tid: u32 = ((u32(global_id.y) * u32(grid_width)) + u32(global_id.x));
   if ((args.dstLayerSize <= tid)) {
     return ;
   };
-  let leftIdx: i32 = (tid * 2);
-  let rightIdx: i32 = (leftIdx + 1);
+  let leftIdx: u32 = (tid * 2u);
+  let rightIdx: u32 = (leftIdx + 1u);
   var state: array<BigInt, 12>;
-  for(var i: i32 = 0; i < 12; i++) {
-    setZero_lmut((&state[i]));
-  };
-  if ((args.layer == 0)) {
-    writeData___hrTzILIV6yyTwCeaP3HUUA_lmut_l_smut_l((&state), 0, (&input), leftIdx);
+
+  { // unrolledIter_i0
+  setZero_lmut((&state[0]));
+  } // unrolledIter_i0
+
+
+  { // unrolledIter_i1
+  setZero_lmut((&state[1]));
+  } // unrolledIter_i1
+
+
+  { // unrolledIter_i2
+  setZero_lmut((&state[2]));
+  } // unrolledIter_i2
+
+
+  { // unrolledIter_i3
+  setZero_lmut((&state[3]));
+  } // unrolledIter_i3
+
+
+  { // unrolledIter_i4
+  setZero_lmut((&state[4]));
+  } // unrolledIter_i4
+
+
+  { // unrolledIter_i5
+  setZero_lmut((&state[5]));
+  } // unrolledIter_i5
+
+
+  { // unrolledIter_i6
+  setZero_lmut((&state[6]));
+  } // unrolledIter_i6
+
+
+  { // unrolledIter_i7
+  setZero_lmut((&state[7]));
+  } // unrolledIter_i7
+
+
+  { // unrolledIter_i8
+  setZero_lmut((&state[8]));
+  } // unrolledIter_i8
+
+
+  { // unrolledIter_i9
+  setZero_lmut((&state[9]));
+  } // unrolledIter_i9
+
+
+  { // unrolledIter_i10
+  setZero_lmut((&state[10]));
+  } // unrolledIter_i10
+
+
+  { // unrolledIter_i11
+  setZero_lmut((&state[11]));
+  } // unrolledIter_i11
+
+  if ((args.layer == 0u)) {
+    writeData_lmut_l_smut_l((&state), 0, (&input), leftIdx);
     if ((rightIdx < args.srcLayerSize)) {
-      writeData___hrTzILIV6yyTwCeaP3HUUA_lmut_l_smut_l((&state), 4, (&input), rightIdx);
+      writeData_lmut_l_smut_l((&state), 4, (&input), rightIdx);
     };
   } else {
     writeData_lmut_l_smut_l((&state), 0, (&nodes), (args.srcOffset + leftIdx));
@@ -64,58 +126,102 @@ the layer-based storage layout shared with the proof generator. */;
   poseidonPermuteMutImpl_lmut((&state));
   if ((args.writeToCap == 1)) {
     if ((tid < args.capLen)) {
-      for(var i: i32 = 0; i < 4; i++) {
-        cap[tid].elems[i] = getCanonical(state[i]);
-      };
+
+      { // unrolledIter_i0
+      cap[tid].elems[0] = getCanonical(state[0]);
+      } // unrolledIter_i0
+
+
+      { // unrolledIter_i1
+      cap[tid].elems[1] = getCanonical(state[1]);
+      } // unrolledIter_i1
+
+
+      { // unrolledIter_i2
+      cap[tid].elems[2] = getCanonical(state[2]);
+      } // unrolledIter_i2
+
+
+      { // unrolledIter_i3
+      cap[tid].elems[3] = getCanonical(state[3]);
+      } // unrolledIter_i3
+
     };
   } else {
-    for(var i: i32 = 0; i < 4; i++) {
-      nodes[(args.dstOffset + tid)].elems[i] = state[i];
-    };
+
+    { // unrolledIter_i0
+    nodes[(args.dstOffset + tid)].elems[0] = state[0];
+    } // unrolledIter_i0
+
+
+    { // unrolledIter_i1
+    nodes[(args.dstOffset + tid)].elems[1] = state[1];
+    } // unrolledIter_i1
+
+
+    { // unrolledIter_i2
+    nodes[(args.dstOffset + tid)].elems[2] = state[2];
+    } // unrolledIter_i2
+
+
+    { // unrolledIter_i3
+    nodes[(args.dstOffset + tid)].elems[3] = state[3];
+    } // unrolledIter_i3
+
   };
 }
 
 fn setZero_lmut(a: ptr<function, BigInt>) {
   /* Sets all limbs of the field element to zero in place */;
-  for(var i: i32 = 0; i < 2; i++) {
+  for(var i: u32 = 0u; i < 2; i++) {
     (*a).limbs[i] = 0u;
   };
 }
 
-fn writeData___hrTzILIV6yyTwCeaP3HUUA_lmut_l_smut_l(dst: ptr<function, array<BigInt, 12>>, dstOffset: i32, data: ptr<storage, array<Input>, read>, srcOffset: i32) {
+fn writeData_lmut_l_smut_l(dst: ptr<function, array<BigInt, 12>>, dstOffset: u32, data: ptr<storage, array<P1HashDigest>, read_write>, srcOffset: u32) {
   /* Writes all elements from `data` at `srcOffset` to `dstOffset` in `state`. */;
-  for(var i: i32 = 0; i < 4; i++) {
-    (*dst)[(dstOffset + i)] = (*data)[srcOffset].elems[i];
-  };
-}
 
-fn writeData_lmut_l_smut_l(dst: ptr<function, array<BigInt, 12>>, dstOffset: i32, data: ptr<storage, array<P1HashDigest>, read_write>, srcOffset: i32) {
-  /* Writes all elements from `data` at `srcOffset` to `dstOffset` in `state`. */;
-  for(var i: i32 = 0; i < 4; i++) {
-    (*dst)[(dstOffset + i)] = (*data)[srcOffset].elems[i];
-  };
+  { // unrolledIter_i0
+  (*dst)[(dstOffset + u32(0))] = (*data)[srcOffset].elems[0];
+  } // unrolledIter_i0
+
+
+  { // unrolledIter_i1
+  (*dst)[(dstOffset + u32(1))] = (*data)[srcOffset].elems[1];
+  } // unrolledIter_i1
+
+
+  { // unrolledIter_i2
+  (*dst)[(dstOffset + u32(2))] = (*data)[srcOffset].elems[2];
+  } // unrolledIter_i2
+
+
+  { // unrolledIter_i3
+  (*dst)[(dstOffset + u32(3))] = (*data)[srcOffset].elems[3];
+  } // unrolledIter_i3
+
 }
 
 fn poseidonPermuteMutImpl_lmut(state: ptr<function, array<BigInt, 12>>) {
   /* Main Poseidon permutation - inlined for performance */;
-  var roundCtr: i32 = 0;
+  var roundCtr: u32 = 0;
   fullRounds_lmut_lmut(state, (&roundCtr));
   partialRoundsNaive_lmut_lmut(state, (&roundCtr));
   fullRounds_lmut_lmut(state, (&roundCtr));
 }
 
-fn fullRounds_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, i32>) {
-  for(var i: i32 = 0; i < 4; i++) {
+fn fullRounds_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, u32>) {
+  for(var i: u32 = 0; i < 4u; i++) {
     constantLayer_lmut_lmut(state, round_ctr);
     sboxLayer_lmut(state);
     mdsLayer_lmut(state);
-    (*round_ctr) = i32(((*round_ctr) + 1));
+    (*round_ctr) = ((*round_ctr) + 1u);
   };
 }
 
-fn constantLayer_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, i32>) {
-  for(var i: i32 = 0; i < 12; i++) {
-    let round_constant: BigInt = rc[(i + (12 * (*round_ctr)))];
+fn constantLayer_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, u32>) {
+  for(var i: u32 = 0; i < 12; i++) {
+    let round_constant: BigInt = rc[(i + (12u * (*round_ctr)))];
     /* XXX: add canonical u64?
 -> Need to construct Montgomery? We just need to turn round constants into
 Montgomery before! */;
@@ -218,7 +324,7 @@ fn slct(a: u32, b: u32, pred: i32) -> u32 {
 }
 
 fn sboxLayer_lmut(state: ptr<function, array<BigInt, 12>>) {
-  for(var i: i32 = 0; i < 12; i++) {
+  for(var i: u32 = 0; i < 12; i++) {
     (*state)[i] = sboxMonomial((*state)[i]);
   };
 }
@@ -237,10 +343,10 @@ fn sboxMonomial(x: BigInt) -> BigInt {
 fn mul_lmut_l_l(r: ptr<function, BigInt>, a: BigInt, b: BigInt) {
   /* Multiplication of two finite field elements stored in `a` and `b`.
 The result is stored in `r`. */;
-  (*r) = mtymul_FIPS___QIgf4wBeke3PA0A9aFzvL0g(a, b, M, false);
+  (*r) = mtymul_FIPS___f4FuSyv5EILd5KB2IIWyig(a, b, M, false);
 }
 
-fn mtymul_FIPS___QIgf4wBeke3PA0A9aFzvL0g(a: BigInt, b: BigInt, M: BigInt, lazyReduce: bool) -> BigInt {
+fn mtymul_FIPS___f4FuSyv5EILd5KB2IIWyig(a: BigInt, b: BigInt, M: BigInt, lazyReduce: bool) -> BigInt {
   /* Montgomery Multiplication using Finely Integrated Product Scanning (FIPS).
 This implementation can be used for fields that do not have any spare bits.
 
@@ -379,11 +485,11 @@ reduction.
 
 Note: This is constant-time */;
   var t: BigInt = BigInt(array<u32, 2>());
-  sub_no_mod___fgwmH9cMDvfJ3LmPHr85yFw_lmut_l_l((&t), (*r), a);
-  ccopy___WPe83eeZbzO9bUJAQK9bAGTA_lmut_l_l(r, t, condition);
+  sub_no_mod___d9cpFFTTlwIJez0po9bQ0J4g_lmut_l_l((&t), (*r), a);
+  ccopy___HjzYt6G86OUE1KbkDccyqg_lmut_l_l(r, t, condition);
 }
 
-fn sub_no_mod___fgwmH9cMDvfJ3LmPHr85yFw_lmut_l_l(r: ptr<function, BigInt>, a: BigInt, b: BigInt) {
+fn sub_no_mod___d9cpFFTTlwIJez0po9bQ0J4g_lmut_l_l(r: ptr<function, BigInt>, a: BigInt, b: BigInt) {
   /* Subtraction of two finite field elements stored in `a` and `b`
 *without* modular reduction.
 The result is stored in `r`. */;
@@ -404,7 +510,7 @@ I.e. this does _not_ perform modular reduction. */;
   return t;
 }
 
-fn ccopy___WPe83eeZbzO9bUJAQK9bAGTA_lmut_l_l(a: ptr<function, BigInt>, b: BigInt, condition: bool) {
+fn ccopy___HjzYt6G86OUE1KbkDccyqg_lmut_l_l(a: ptr<function, BigInt>, b: BigInt, condition: bool) {
   /* Conditional copy.
 If condition is true: b is copied into a
 If condition is false: a is left unmodified
@@ -417,7 +523,7 @@ Note: This is constant-time */;
   } else {
     cond = -1;
   };
-  for(var i: i32 = 0; i < 2; i++) {
+  for(var i: u32 = 0u; i < 2; i++) {
     (*a).limbs[i] = slct(b.limbs[i], (*a).limbs[i], cond);
   };
 }
@@ -430,17 +536,17 @@ with _at least_ multiplication. */;
   var tmp: array<BigInt, 12>;
   /* XXX: avoid this copy? */;
   tmp = (*state);
-  for(var r: i32 = 0; r < 12; r++) {
+  for(var r: u32 = 0; r < 12; r++) {
     /* XXX: pass by reference! */;
     (*state)[r] = mdsRowShfNaive(r, tmp);
   };
 }
 
-fn mdsRowShfNaive(r: i32, v: array<BigInt, 12>) -> BigInt {
+fn mdsRowShfNaive(r: u32, v: array<BigInt, 12>) -> BigInt {
   var res: BigInt = BigInt(array<u32, 2>());
   var val: BigInt;
-  for(var i: i32 = 0; i < 12; i++) {
-    mul_lmut_l_l((&val), v[((i + r) % 12)], mdsCirc[i]);
+  for(var i: u32 = 0; i < 12; i++) {
+    mul_lmut_l_l((&val), v[((i + r) % 12u)], mdsCirc[i]);
     add_lmut_l_l((&res), res, val);
   };
   mul_lmut_l_l((&val), v[r], mdsDiag[r]);
@@ -448,12 +554,12 @@ fn mdsRowShfNaive(r: i32, v: array<BigInt, 12>) -> BigInt {
   return res;
 }
 
-fn partialRoundsNaive_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, i32>) {
-  for(var i: i32 = 0; i < 22; i++) {
+fn partialRoundsNaive_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, u32>) {
+  for(var i: u32 = 0; i < 22u; i++) {
     constantLayer_lmut_lmut(state, round_ctr);
     (*state)[0] = sboxMonomial((*state)[0]);
     mdsLayer_lmut(state);
-    (*round_ctr) = i32(((*round_ctr) + 1));
+    (*round_ctr) = ((*round_ctr) + 1u);
   };
 }
 
@@ -530,3 +636,4 @@ Note: `_gpu` prefix to not confuse Nim compiler with `precompute/muladd2` */;
   (*lo) = add_co((*lo), c2);
   (*hi) = add_ci((*hi), 0u);
 }
+

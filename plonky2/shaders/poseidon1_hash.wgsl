@@ -1,20 +1,19 @@
-requires unrestricted_pointer_parameters;
-
 @group(0) @binding(0) var<storage, read_write> output: array<P1HashDigest>;
 @group(0) @binding(1) var<storage, read_write> input: array<BigInt>;
-@group(0) @binding(2) var<storage, read> num: i32;
-@group(0) @binding(3) var<storage, read> elementsPerLeaf: i32;
+@group(0) @binding(2) var<storage, read> num: u32;
+@group(0) @binding(3) var<storage, read> elementsPerLeaf: u32;
 @group(0) @binding(4) var<storage, read> mdsCirc: array<BigInt, 12>;
 @group(0) @binding(5) var<storage, read> mdsDiag: array<BigInt, 12>;
 @group(0) @binding(6) var<storage, read> rc: array<BigInt, 360>;
 
+const WORKGROUP_SIZE: u32 = 64u;
+const WORKGROUP_SIZE_Y: u32 = 1u;
 var<private> carry_flag: u32 = 0u;
 const M: BigInt = BigInt(array(u32(1), u32(4294967295)));
 const MontyOne: BigInt = BigInt(array(u32(4294967295), u32(0)));
 const PP1D2: BigInt = BigInt(array(u32(2147483649), u32(2147483647)));
 const M0NInv: u32 = 4294967295;
 const R2modP: BigInt = BigInt(array(u32(1), u32(4294967294)));
-const WORKGROUP_SIZE: i32 = 64;
 
 struct BigInt {
   limbs: array<u32, 2>,
@@ -22,12 +21,13 @@ struct BigInt {
 struct P1HashDigest {
   elems: array<BigInt, 4>,
 };
-struct Input {
-  data: BigInt,
-};
 
-@compute @workgroup_size(WORKGROUP_SIZE)
-fn poseidon1Hash(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
+@compute @workgroup_size(WORKGROUP_SIZE, WORKGROUP_SIZE_Y)
+fn poseidon1Hash(@builtin(local_invocation_id)  local_id : vec3<u32>,      // ≈ CUDA threadIdx
+@builtin(workgroup_id)         workgroup_id: vec3<u32>,   // ≈ CUDA blockIdx
+@builtin(num_workgroups)       num_workgroups: vec3<u32>, // ≈ CUDA gridDim
+@builtin(global_invocation_id) global_id: vec3<u32>,      // = workgroup_id * workgroup_size + local_id
+) {
   /* Computes a Poseidon1 hash function for `num` input vectors, each of which is `elementsPerLeaf`
 elements long.
 
@@ -42,30 +42,30 @@ Let `N` be the total number of inputs and `k` the size of each vector.
 This is in contrast to the layout one would normally encounter, corresponding to
 `seq[seq[T]]` where the inner `seq[T]` is each vector to be hashed. */;
   let grid_width: u32 = (num_workgroups.x * 64u);
-  let tid: i32 = ((i32(global_id.y) * i32(grid_width)) + i32(global_id.x));
+  let tid: u32 = ((u32(global_id.y) * u32(grid_width)) + u32(global_id.x));
   if ((num <= tid)) {
     return ;
   };
   var state: array<BigInt, 12>;
-  for(var i: i32 = 0; i < 12; i++) {
+  for(var i: u32 = 0u; i < 12; i++) {
     setZero_lmut((&state[i]));
   };
-  let numChunks: i32 = (elementsPerLeaf / 8);
-  for(var i: i32 = 0; i < numChunks; i++) {
-    for(var j: i32 = 0; j < 8; j++) {
-      let elementIdx: i32 = ((i * 8) + j);
-      let idx: i32 = ((elementIdx * num) + tid);
+  let numChunks: u32 = (elementsPerLeaf / 8u);
+  for(var i: u32 = 0; i < numChunks; i++) {
+    for(var j: u32 = 0; j < 8; j++) {
+      let elementIdx: u32 = ((i * 8u) + j);
+      let idx: u32 = ((elementIdx * num) + tid);
       state[j] = input[idx];
     };
     poseidonPermuteMutImpl_lmut((&state));
   };
-  let rem: i32 = (elementsPerLeaf % 8);
-  for(var j: i32 = 0; j < rem; j++) {
-    let elementIdx: i32 = ((numChunks * 8) + j);
-    let idx: i32 = ((elementIdx * num) + tid);
+  let rem: u32 = (elementsPerLeaf % 8u);
+  for(var j: u32 = 0; j < rem; j++) {
+    let elementIdx: u32 = ((numChunks * 8u) + j);
+    let idx: u32 = ((elementIdx * num) + tid);
     state[j] = input[idx];
   };
-  if ((0 < rem)) {
+  if ((0u < rem)) {
     poseidonPermuteMutImpl_lmut((&state));
   };
 
@@ -92,31 +92,31 @@ This is in contrast to the layout one would normally encounter, corresponding to
 
 fn setZero_lmut(a: ptr<function, BigInt>) {
   /* Sets all limbs of the field element to zero in place */;
-  for(var i: i32 = 0; i < 2; i++) {
+  for(var i: u32 = 0u; i < 2; i++) {
     (*a).limbs[i] = 0u;
   };
 }
 
 fn poseidonPermuteMutImpl_lmut(state: ptr<function, array<BigInt, 12>>) {
   /* Main Poseidon permutation - inlined for performance */;
-  var roundCtr: i32 = 0;
+  var roundCtr: u32 = 0;
   fullRounds_lmut_lmut(state, (&roundCtr));
   partialRoundsNaive_lmut_lmut(state, (&roundCtr));
   fullRounds_lmut_lmut(state, (&roundCtr));
 }
 
-fn fullRounds_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, i32>) {
-  for(var i: i32 = 0; i < 4; i++) {
+fn fullRounds_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, u32>) {
+  for(var i: u32 = 0; i < 4u; i++) {
     constantLayer_lmut_lmut(state, round_ctr);
     sboxLayer_lmut(state);
     mdsLayer_lmut(state);
-    (*round_ctr) = i32(((*round_ctr) + 1));
+    (*round_ctr) = ((*round_ctr) + 1u);
   };
 }
 
-fn constantLayer_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, i32>) {
-  for(var i: i32 = 0; i < 12; i++) {
-    let round_constant: BigInt = rc[(i + (12 * (*round_ctr)))];
+fn constantLayer_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, u32>) {
+  for(var i: u32 = 0; i < 12; i++) {
+    let round_constant: BigInt = rc[(i + (12u * (*round_ctr)))];
     /* XXX: add canonical u64?
 -> Need to construct Montgomery? We just need to turn round constants into
 Montgomery before! */;
@@ -219,7 +219,7 @@ fn slct(a: u32, b: u32, pred: i32) -> u32 {
 }
 
 fn sboxLayer_lmut(state: ptr<function, array<BigInt, 12>>) {
-  for(var i: i32 = 0; i < 12; i++) {
+  for(var i: u32 = 0; i < 12; i++) {
     (*state)[i] = sboxMonomial((*state)[i]);
   };
 }
@@ -238,10 +238,10 @@ fn sboxMonomial(x: BigInt) -> BigInt {
 fn mul_lmut_l_l(r: ptr<function, BigInt>, a: BigInt, b: BigInt) {
   /* Multiplication of two finite field elements stored in `a` and `b`.
 The result is stored in `r`. */;
-  (*r) = mtymul_FIPS___QWwLisdgQaZHAKFxySkDgg(a, b, M, false);
+  (*r) = mtymul_FIPS___f4FuSyv5EILd5KB2IIWyig(a, b, M, false);
 }
 
-fn mtymul_FIPS___QWwLisdgQaZHAKFxySkDgg(a: BigInt, b: BigInt, M: BigInt, lazyReduce: bool) -> BigInt {
+fn mtymul_FIPS___f4FuSyv5EILd5KB2IIWyig(a: BigInt, b: BigInt, M: BigInt, lazyReduce: bool) -> BigInt {
   /* Montgomery Multiplication using Finely Integrated Product Scanning (FIPS).
 This implementation can be used for fields that do not have any spare bits.
 
@@ -380,11 +380,11 @@ reduction.
 
 Note: This is constant-time */;
   var t: BigInt = BigInt(array<u32, 2>());
-  sub_no_mod___xGfoTOxdlavKmk9b7clOuPQ_lmut_l_l((&t), (*r), a);
-  ccopy___Frdj29bAhVs5kgggHIqR6tw_lmut_l_l(r, t, condition);
+  sub_no_mod___d9cpFFTTlwIJez0po9bQ0J4g_lmut_l_l((&t), (*r), a);
+  ccopy___HjzYt6G86OUE1KbkDccyqg_lmut_l_l(r, t, condition);
 }
 
-fn sub_no_mod___xGfoTOxdlavKmk9b7clOuPQ_lmut_l_l(r: ptr<function, BigInt>, a: BigInt, b: BigInt) {
+fn sub_no_mod___d9cpFFTTlwIJez0po9bQ0J4g_lmut_l_l(r: ptr<function, BigInt>, a: BigInt, b: BigInt) {
   /* Subtraction of two finite field elements stored in `a` and `b`
 *without* modular reduction.
 The result is stored in `r`. */;
@@ -405,7 +405,7 @@ I.e. this does _not_ perform modular reduction. */;
   return t;
 }
 
-fn ccopy___Frdj29bAhVs5kgggHIqR6tw_lmut_l_l(a: ptr<function, BigInt>, b: BigInt, condition: bool) {
+fn ccopy___HjzYt6G86OUE1KbkDccyqg_lmut_l_l(a: ptr<function, BigInt>, b: BigInt, condition: bool) {
   /* Conditional copy.
 If condition is true: b is copied into a
 If condition is false: a is left unmodified
@@ -418,7 +418,7 @@ Note: This is constant-time */;
   } else {
     cond = -1;
   };
-  for(var i: i32 = 0; i < 2; i++) {
+  for(var i: u32 = 0u; i < 2; i++) {
     (*a).limbs[i] = slct(b.limbs[i], (*a).limbs[i], cond);
   };
 }
@@ -431,17 +431,17 @@ with _at least_ multiplication. */;
   var tmp: array<BigInt, 12>;
   /* XXX: avoid this copy? */;
   tmp = (*state);
-  for(var r: i32 = 0; r < 12; r++) {
+  for(var r: u32 = 0; r < 12; r++) {
     /* XXX: pass by reference! */;
     (*state)[r] = mdsRowShfNaive(r, tmp);
   };
 }
 
-fn mdsRowShfNaive(r: i32, v: array<BigInt, 12>) -> BigInt {
+fn mdsRowShfNaive(r: u32, v: array<BigInt, 12>) -> BigInt {
   var res: BigInt = BigInt(array<u32, 2>());
   var val: BigInt;
-  for(var i: i32 = 0; i < 12; i++) {
-    mul_lmut_l_l((&val), v[((i + r) % 12)], mdsCirc[i]);
+  for(var i: u32 = 0; i < 12; i++) {
+    mul_lmut_l_l((&val), v[((i + r) % 12u)], mdsCirc[i]);
     add_lmut_l_l((&res), res, val);
   };
   mul_lmut_l_l((&val), v[r], mdsDiag[r]);
@@ -449,11 +449,12 @@ fn mdsRowShfNaive(r: i32, v: array<BigInt, 12>) -> BigInt {
   return res;
 }
 
-fn partialRoundsNaive_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, i32>) {
-  for(var i: i32 = 0; i < 22; i++) {
+fn partialRoundsNaive_lmut_lmut(state: ptr<function, array<BigInt, 12>>, round_ctr: ptr<function, u32>) {
+  for(var i: u32 = 0; i < 22u; i++) {
     constantLayer_lmut_lmut(state, round_ctr);
     (*state)[0] = sboxMonomial((*state)[0]);
     mdsLayer_lmut(state);
-    (*round_ctr) = i32(((*round_ctr) + 1));
+    (*round_ctr) = ((*round_ctr) + 1u);
   };
 }
+
