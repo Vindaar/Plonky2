@@ -62,8 +62,8 @@ pub struct MerkleTreeGpuContext {
     pub merkle_bind_group_layout: Rc<BindGroupLayout>,
     pub leaf_pipeline: Rc<ComputePipeline>,
     pub leaf_bind_group_layout: Rc<BindGroupLayout>,
-    pub to_mont_pipeline: Rc<ComputePipeline>,
-    pub to_mont_bind_group_layout: Rc<BindGroupLayout>,
+    pub transpose_to_mont_pipeline: Rc<ComputePipeline>,
+    pub transpose_to_mont_bind_group_layout: Rc<BindGroupLayout>,
 
     pub to_canon_pipeline: Rc<ComputePipeline>,
     pub to_canon_bind_group_layout: Rc<BindGroupLayout>,
@@ -86,8 +86,8 @@ impl MerkleTreeGpuContext {
         merkle_bind_group_layout: BindGroupLayout,
         leaf_pipeline: ComputePipeline,
         leaf_bind_group_layout: BindGroupLayout,
-        to_mont_pipeline: ComputePipeline,
-        to_mont_bind_group_layout: BindGroupLayout,
+        transpose_to_mont_pipeline: ComputePipeline,
+        transpose_to_mont_bind_group_layout: BindGroupLayout,
 
         to_canon_pipeline: ComputePipeline,
         to_canon_bind_group_layout: BindGroupLayout,
@@ -113,8 +113,8 @@ impl MerkleTreeGpuContext {
             merkle_bind_group_layout: Rc::new(merkle_bind_group_layout),
             leaf_pipeline: Rc::new(leaf_pipeline),
             leaf_bind_group_layout: Rc::new(leaf_bind_group_layout),
-            to_mont_pipeline: Rc::new(to_mont_pipeline),
-            to_mont_bind_group_layout: Rc::new(to_mont_bind_group_layout),
+            transpose_to_mont_pipeline: Rc::new(transpose_to_mont_pipeline),
+            transpose_to_mont_bind_group_layout: Rc::new(transpose_to_mont_bind_group_layout),
             to_canon_pipeline: Rc::new(to_canon_pipeline),
             to_canon_bind_group_layout: Rc::new(to_canon_bind_group_layout),
             readback_staging: RefCell::new(None),
@@ -514,8 +514,9 @@ pub async fn initialize() -> Result<()> {
     let merkle_pipeline = create_merkle_pipeline(&device, &merkle_bind_group_layout)?;
     let leaf_bind_group_layout = create_leaf_hash_bind_group_layout(&device);
     let leaf_pipeline = create_leaf_hash_pipeline(&device, &leaf_bind_group_layout)?;
-    let to_mont_bind_group_layout = create_to_mont_bind_group_layout(&device);
-    let to_mont_pipeline = create_to_mont_pipeline(&device, &to_mont_bind_group_layout)?;
+    let transpose_to_mont_bind_group_layout = create_transpose_to_mont_bind_group_layout(&device);
+    let transpose_to_mont_pipeline =
+        create_transpose_to_mont_pipeline(&device, &transpose_to_mont_bind_group_layout)?;
     let to_canon_bind_group_layout = create_to_canon_bind_group_layout(&device);
     let to_canon_pipeline = create_to_canon_pipeline(&device, &to_canon_bind_group_layout)?;
 
@@ -532,8 +533,8 @@ pub async fn initialize() -> Result<()> {
         merkle_bind_group_layout,
         leaf_pipeline,
         leaf_bind_group_layout,
-        to_mont_pipeline,
-        to_mont_bind_group_layout,
+        transpose_to_mont_pipeline,
+        transpose_to_mont_bind_group_layout,
         to_canon_pipeline,
         to_canon_bind_group_layout,
         mds_circ,
@@ -603,26 +604,26 @@ fn create_leaf_hash_pipeline(
     )
 }
 
-fn create_to_mont_pipeline(
+fn create_transpose_to_mont_pipeline(
     device: &Device,
     bind_group_layout: &BindGroupLayout,
 ) -> Result<ComputePipeline> {
     let shader_module = device.create_shader_module(wgpu::include_wgsl!(
-        "../../shaders/buffer_canonical_to_montgomery.wgsl"
+        "../../shaders/transpose_to_montgomery.wgsl"
     ));
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Buffer Canonical to Montgomery Pipeline Layout"),
+        label: Some("Buffer Transpose to Montgomery Pipeline Layout"),
         bind_group_layouts: &[bind_group_layout],
         push_constant_ranges: &[],
     });
 
     Ok(
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Buffer Canonical to Montgomery Pipeline"),
+            label: Some("Buffer Transpose to Montgomery Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
-            entry_point: Some("bufferToMontgomery"),
+            entry_point: Some("transposeNaive"),
             compilation_options: Default::default(),
             cache: None,
         }),
@@ -844,11 +845,11 @@ fn create_leaf_hash_bind_group_layout(device: &Device) -> BindGroupLayout {
     })
 }
 
-fn create_to_mont_bind_group_layout(device: &Device) -> BindGroupLayout {
+fn create_transpose_to_mont_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Buffer Canonical to Montgomery Bind Group Layout"),
+        label: Some("Buffer Transpose to Montgomery Bind Group Layout"),
         entries: &[
-            // 0: input & output buffer to convert
+            // 0: output buffer
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -859,14 +860,36 @@ fn create_to_mont_bind_group_layout(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
-            // 1: number of elements in the buffer
+            // 1: input buffer to transpose & convert
             wgpu::BindGroupLayoutEntry {
-                binding: 1,
+                binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(std::mem::size_of::<i32>() as u64),
+                    min_binding_size: NonZeroU64::new(BYTES_PER_BIGINT as u64),
+                },
+                count: None,
+            },
+            // 2: number of leaves
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<u32>() as u64),
+                },
+                count: None,
+            },
+            // 2: elements per leaf
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<u32>() as u64),
                 },
                 count: None,
             },
@@ -1117,7 +1140,7 @@ where
                 .await?;
                 log_timing("⚡ GPU execution (wait_for_queue)", now_ms() - wait_start);
 
-                let full_tree_readback = full_tree_readback_enabled();
+                let full_tree_readback = true; // full_tree_readback_enabled();
                 if !full_tree_readback {
                     log("Full tree readback disabled; skipping leaf/node staging copies (cap-only mode)");
                 }
@@ -1612,6 +1635,160 @@ fn transpose_leaves_to_words<F: RichField>(leaves: &[Vec<F>]) -> Result<(Vec<u32
     Ok((words, elements_per_leaf))
 }
 
+//proc sendChunkData(device: GpuDevice, numLeaves: int, elemsPerLeaf: int, data: seq[UInt32Array]): GpuBuffer =
+//  ## We send the data to the device in chunks.
+//  ##
+//  const ChunkSize = 1000
+//  var buf = newUint32Array(2 * ChunkSize * elemsPerLeaf) # num of elements, 2* for 2 limbs
+//
+//  let dst = device.createBuffer(numLeaves * 8 * elemsPerLeaf, {Storage, CopyDst})
+//  dst.label = "send_chunk_input"
+//  var i = 0
+//  while i < data.len:
+//    let start = i
+//    #let upto = min(1000, data.len - i)
+//    let upto = if i + ChunkSize < data.len: ChunkSize
+//               else: data.len - i
+//    #echo "UPTO: ", upto, " i = ", i
+//    for j in 0 ..< upto:
+//      buf.set(data[start + j], j * elemsPerLeaf)
+//      #copyMem(buf[j * elemsPerLeaf].addr, data[start + j][0].addr, elemsPerLeaf * sizeof(uint64))
+//    inc i, upto
+//    # write full buffer
+//    let offsetBytes      = start * elemsPerLeaf * sizeof(uint64)
+//    #let bytesThisChunk   = upto  * elemsPerLeaf * sizeof(uint64)
+//    let elemsThisChunk   = upto  * elemsPerLeaf
+//    echo "Copying to : ", offsetBytes.int, " #elements: ", elemsThisChunk.int
+//    device.queue.writeBuffer(dst, offsetBytes, buf, 0, elemsThisChunk)
+//  result = dst
+
+fn send_chunk_data<F: RichField>(ctx: &MerkleTreeGpuContext, leaves: &[Vec<F>]) -> Buffer {
+    //Result<(Vec<u32>, usize)> {
+    let num_leaves = leaves.len();
+    let elems_per_leaf = leaves[0].len();
+
+    const CHUNK_SIZE: usize = 1000;
+
+    //let total_fields = num_leaves.checked_mul(elems_per_leaf).ok_or_else(|| {
+    //    anyhow!(
+    //        "leaf transposition overflow: {} leaves × {} elements",
+    //        num_leaves,
+    //        elems_per_leaf
+    //    )
+    //})?;
+    //let total_words = total_fields
+    //    .checked_mul(BIGINT_LIMBS)
+    //    .ok_or_else(|| anyhow!("leaf transposition word count overflow: {total_fields} fields"))?;
+    //
+    //let mut words = Vec::new();
+    //if let Err(err) = words.try_reserve_exact(total_words) {
+    //    return Err(anyhow!(
+    //        "failed to reserve {total_words} words for canonical leaf buffer: {err}"
+    //    ));
+    //}
+
+    //for elem_idx in 0..elems_per_leaf {
+    //    for leaf in leaves {
+    //        words.extend_from_slice(&field_to_words(&leaf[elem_idx]));
+    //    }
+    //}
+
+    let size = (num_leaves * elems_per_leaf * 2 * core::mem::size_of::<u32>()) as u64;
+    let mut dst = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("merkle-send-chunks"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut i = 0;
+    //let buf: Vec<u32> = Vec::with_capacity(2 * CHUNK_SIZE * elems_per_leaf);
+    while i < num_leaves {
+        //ctx.queue.write_buffer();
+        let start = i;
+        //#let upto = min(1000, data.len - i);
+        //let upto = if i + CHUNK_SIZE < num_leaves {
+        //    CHUNK_SIZE
+        //} else {
+        //    num_leaves - i
+        //};
+        //let elems_this_chunk = upto * elems_per_leaf;
+        // echo "UPTO: ", upto, " i = ", i
+        // Pack this chunk into `buf` (contiguously).
+        // Fill the driver's staging memory directly
+        //       ctx.queue
+        //           .write_buffer_with(&dst, offset_bytes, (elems_this_chunk as u64) * 8)
+        //           .copy_from_slice(|dst_bytes| {
+        //               // View the staging region as mutable u32s
+        //               let out_u32: &mut [u32] = bytemuck::cast_slice_mut(dst_bytes);
+        //               debug_assert_eq!(out_u32.len(), 2 * elems_this_chunk);
+        //
+        //               let mut base = 0;
+        //               for leaf in &data[start..start + upto] {
+        //                   debug_assert_eq!(leaf.len(), elems_per_leaf);
+        //                   for &val in &leaf[..elems_per_leaf] {
+        //                       let [lo, hi] = field_to_words(val);
+        //                       out_u32[base] = lo;
+        //                       out_u32[base + 1] = hi;
+        //                       base += 2;
+        //                   }
+        //               }
+        //           });
+        let upto = (num_leaves - i).min(CHUNK_SIZE);
+        let elems_this_chunk = upto * elems_per_leaf;
+
+        let offset_bytes = (start as u64) * (elems_per_leaf as u64) * 8;
+        let size_bytes = (elems_this_chunk as u64) * 8;
+
+        if let Some(mut view) =
+            ctx.queue
+                .write_buffer_with(&dst, offset_bytes, size_bytes.try_into().unwrap())
+        {
+            // SAFELY reinterpret &mut [u8] as &mut [u32] if alignment allows.
+            // align_to_mut() handles potential misalignment without UB.
+            let (head, out_u32, tail) = unsafe { view.align_to_mut::<u32>() };
+            debug_assert!(
+                head.is_empty() && tail.is_empty(),
+                "staging view not u32-aligned"
+            );
+
+            // We expect exactly 2 u32 words per element:
+            debug_assert_eq!(out_u32.len(), 2 * elems_this_chunk);
+
+            // Fill directly from field_to_words:
+            let mut idx = 0;
+            for leaf in &leaves[start..start + upto] {
+                for &val in &leaf[..elems_per_leaf] {
+                    let [lo, hi] = field_to_words(&val);
+                    out_u32[idx] = lo;
+                    out_u32[idx + 1] = hi;
+                    idx += 2;
+                }
+            }
+            // Dropping `view` schedules the copy; it transfers on the next queue.submit().
+        } else {
+            // Fallback: extremely unlikely unless validation fails.
+            // You could bail or fall back to a reusable Vec<u32> + write_buffer here.
+            panic!("write_buffer_with failed validation");
+        }
+        //for j in 0..upto {
+        //    let dst_off = j * (2 * elems_per_leaf);
+        //    let src = data[start + j];
+        //    // Copy the 2*elems_per_leaf u32 limbs for this leaf
+        //    buf[dst_off..dst_off + 2 * elems_per_leaf].copy_from_slice(src);
+        //}
+        //i += upto;
+        //
+        //let offset_bytes = start * elems_per_leaf * sizeof(uint64);
+        //
+        //
+        //ctx.queue
+        //    .write_buffer_with(&dst, elems_this_chunk, buf.len())
+        //    .copy_from_slice(buf)
+    }
+
+    dst
+}
+
 /// Computes the required workgroup sizes in x and y to produce `num` threads.
 /// We assume a workgroup size of 64!
 fn compute_workgroups(num: usize) -> (u32, u32) {
@@ -1732,59 +1909,163 @@ fn hash_leaves_gpu(
     Ok((output_buffer, submission_index))
 }
 
-/// Converts the input buffer from canonical representation into Montgomery representation for
-/// faster further processing on the GPU.
-/// `num` is the number of field elements in the buffer.
-fn canonical_to_montgomery_gpu(
-    ctx: &MerkleTreeGpuContext,
-    canonical_words: &[u32],
-    num: usize,
-) -> Result<(Buffer, SubmissionIndex)> {
-    let expected_words = num
-        .checked_mul(BIGINT_LIMBS)
-        .ok_or_else(|| anyhow!("canonical word count overflow: {num} elements"))?;
-    ensure!(
-        canonical_words.len() == expected_words,
-        "canonical buffer length {} mismatches expected {} words",
-        canonical_words.len(),
-        expected_words
-    );
+// /// Converts the input buffer from canonical representation into Montgomery representation for
+// /// faster further processing on the GPU.
+// /// `num` is the number of field elements in the buffer.
+// fn canonical_to_montgomery_gpu(
+//     ctx: &MerkleTreeGpuContext,
+//     canonical_words: &[u32],
+//     num: usize,
+// ) -> Result<(Buffer, SubmissionIndex)> {
+//     let expected_words = num
+//         .checked_mul(BIGINT_LIMBS)
+//         .ok_or_else(|| anyhow!("canonical word count overflow: {num} elements"))?;
+//     ensure!(
+//         canonical_words.len() == expected_words,
+//         "canonical buffer length {} mismatches expected {} words",
+//         canonical_words.len(),
+//         expected_words
+//     );
+//
+//     let input_buffer = ctx
+//         .device
+//         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+//             label: Some("poseidon-leaf-input"),
+//             contents: bytemuck::cast_slice(canonical_words),
+//             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+//         });
+//
+//     let num_i32 = num as i32;
+//     let num_buffer = ctx
+//         .device
+//         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+//             label: Some("buf-elems-count"),
+//             contents: bytemuck::bytes_of(&num_i32),
+//             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+//         });
+//
+//     let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+//         label: Some("to-montgomery-bind-group"),
+//         layout: &ctx.to_mont_bind_group_layout,
+//         entries: &[
+//             wgpu::BindGroupEntry {
+//                 binding: 0,
+//                 resource: input_buffer.as_entire_binding(),
+//             },
+//             wgpu::BindGroupEntry {
+//                 binding: 1,
+//                 resource: num_buffer.as_entire_binding(),
+//             },
+//         ],
+//     });
+//     // Time dispatch
+//     let dispatch_start = now_ms();
+//
+//     let (workgroups_x, workgroups_y) = compute_workgroups(num);
+//
+//     log::info!(
+//         "Starting workgroups in (x, y) : ({}, {})",
+//         workgroups_x,
+//         workgroups_y
+//     );
+//
+//     let mut encoder = ctx
+//         .device
+//         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+//             label: Some("buf-canon-mont-encoder"),
+//         });
+//
+//     {
+//         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+//             label: Some("buf-canon-mont-pass"),
+//             timestamp_writes: None,
+//         });
+//         pass.set_pipeline(&ctx.to_mont_pipeline);
+//         pass.set_bind_group(0, &bind_group, &[]);
+//         //pass.dispatch_workgroups(workgroups_x, 1, 1);
+//         pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+//     }
+//
+//     let submission_index = ctx.queue.submit(Some(encoder.finish()));
+//     log_queue_submission("canonical_to_montgomery_gpu", submission_index.clone());
+//     log_timing("  Canon->Mont dispatch", now_ms() - dispatch_start);
+//
+//     Ok((input_buffer, submission_index))
+// }
 
-    let input_buffer = ctx
+fn transpose_to_mont_gpu(
+    ctx: &MerkleTreeGpuContext,
+    input_buf: &Buffer,
+    num_leaves: usize,
+    elems_per_leaf: usize,
+) -> Result<(Buffer, SubmissionIndex)> {
+    //let expected_words = num
+    //    .checked_mul(BIGINT_LIMBS)
+    //    .ok_or_else(|| anyhow!("tranpsose word count overflow: {num} elements"))?;
+    //ensure!(
+    //    canonical_words.len() == expected_words,
+    //    "canonical buffer length {} mismatches expected {} words",
+    //    canonical_words.len(),
+    //    expected_words
+    //);
+
+    let size = input_buf.size();
+    let output_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("transpose-to-mont-output"),
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        //usage: wgpu::BufferUsage::COPY_DST, // don'
+        mapped_at_creation: false,
+    });
+
+    let num_u32 = num_leaves as u32;
+    let num_buf = ctx
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("poseidon-leaf-input"),
-            contents: bytemuck::cast_slice(canonical_words),
+            label: Some("transpose-buf-num-leaves"),
+            contents: bytemuck::bytes_of(&num_u32),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-
-    let num_i32 = num as i32;
-    let num_buffer = ctx
+    let elems_per_leaf_u32 = elems_per_leaf as u32;
+    let elems_per_leaf_buf = ctx
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("buf-elems-count"),
-            contents: bytemuck::bytes_of(&num_i32),
+            label: Some("transpose-buf-elems-per-leaf"),
+            contents: bytemuck::bytes_of(&elems_per_leaf_u32),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
     let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("to-montgomery-bind-group"),
-        layout: &ctx.to_mont_bind_group_layout,
+        layout: &ctx.transpose_to_mont_bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: input_buffer.as_entire_binding(),
+                resource: output_buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: num_buffer.as_entire_binding(),
+                resource: input_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: num_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: elems_per_leaf_buf.as_entire_binding(),
             },
         ],
     });
     // Time dispatch
     let dispatch_start = now_ms();
 
-    let (workgroups_x, workgroups_y) = compute_workgroups(num);
+    let bx = 32;
+    let by = 32;
+    let workgroups_x = (elems_per_leaf + bx - 1) / bx; // across columns;
+    let workgroups_y = (num_leaves + by - 1) / by; // across rows;
+
+    //let (workgroups_x, workgroups_y) = compute_workgroups(num);
 
     log::info!(
         "Starting workgroups in (x, y) : ({}, {})",
@@ -1795,25 +2076,25 @@ fn canonical_to_montgomery_gpu(
     let mut encoder = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("buf-canon-mont-encoder"),
+            label: Some("transpose-to-mont-encoder"),
         });
 
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("buf-canon-mont-pass"),
+            label: Some("transpose-to-mont-pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&ctx.to_mont_pipeline);
+        pass.set_pipeline(&ctx.transpose_to_mont_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         //pass.dispatch_workgroups(workgroups_x, 1, 1);
-        pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        pass.dispatch_workgroups(workgroups_x as u32, workgroups_y as u32, 1);
     }
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
     log_queue_submission("canonical_to_montgomery_gpu", submission_index.clone());
     log_timing("  Canon->Mont dispatch", now_ms() - dispatch_start);
 
-    Ok((input_buffer, submission_index))
+    Ok((output_buf, submission_index))
 }
 
 /// Converts the input buffer from Montgomery representation into canonical representation
@@ -1965,8 +2246,8 @@ where
     scrub_readback_state(ctx_ref);
 
     // Time data conversion
-    let convert_start = now_ms();
-    let (canonical_words, elements_per_leaf) = transpose_leaves_to_words(leaves)?;
+    //let convert_start = now_ms();
+    //let (canonical_words, elements_per_leaf) = transpose_leaves_to_words(leaves)?;
     ensure!(
         elements_per_leaf > 0,
         "GPU Poseidon hashing received empty leaves"
@@ -1975,14 +2256,24 @@ where
         elements_per_leaf <= i32::MAX as usize,
         "elements_per_leaf must fit in i32, got {elements_per_leaf}"
     );
-    log_timing("  Leaf data transpose", now_ms() - convert_start);
+    //log_timing("  Leaf data transpose", now_ms() - convert_start);
 
     // TODO: Perform single canonical -> Montgomery representation pass on inputs
+
+    // 4. Send data in chunks to the GPU and then transpose + Montgomery convert on GPU
+    let chunk_send_start = now_ms();
+    let input_buf = send_chunk_data(&ctx, leaves);
+    let chunk_send_stop = now_ms();
+    log_timing(
+        "    Sending data in chunks to GPU",
+        chunk_send_stop - chunk_send_start,
+    );
 
     // Convert canonical words into Montgomery form via the GPU pipeline
     let canon_to_mont_start = now_ms();
     let (input_buffer, _submission_index) =
-        canonical_to_montgomery_gpu(&ctx, &canonical_words, num_leaves * elements_per_leaf)?;
+        //canonical_to_montgomery_gpu(&ctx, &canonical_words, num_leaves * elements_per_leaf)?;
+        transpose_to_mont_gpu(&ctx, &input_buf, num_leaves, elements_per_leaf)?;
     if !saw_submission {
         saw_submission = true;
     }
@@ -1991,7 +2282,7 @@ where
         now_ms() - canon_to_mont_start,
     );
     // Release the large canonical word buffer before launching downstream GPU work.
-    drop(canonical_words);
+    //drop(canonical_words);
 
     // TODO: After main Merkle tree kernel calls: single Montgomery -> canonical pass for all digsts / nodes
 
