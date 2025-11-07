@@ -416,6 +416,19 @@ fn log_timing(label: &str, duration_ms: f64) {
     }
 }
 
+/// Log timing information to console
+fn log_timing_verbose(label: &str, duration_ms: f64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        #[cfg(feature = "gpu_merkle_verbose_time_logging")]
+        console::log_1(&format!("⏱️  {}: {:.2}ms", label, duration_ms).into());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        println!("⏱️  {}: {:.2}ms", label, duration_ms);
+    }
+}
+
 /// Yield back to the JS event loop to give pending GPU callbacks a chance to fire.
 async fn yield_to_event_loop() {
     let promise = Promise::resolve(&JsValue::NULL);
@@ -1122,7 +1135,7 @@ where
                 num_layers_to_cap,
                 queue_completion,
             } => {
-                console::log_1(&"=== PHASE 4: GPU Completion & Readback ===".into());
+                log("=== PHASE 4: GPU Completion & Readback ===");
                 log(if queue_completion.is_some() {
                     "wait_for_queue will await queued completion callback"
                 } else {
@@ -1167,8 +1180,8 @@ where
                     .await?;
                     let leaf_total_ms = now_ms() - leaf_read_start;
                     let leaf_readback_ms = (leaf_total_ms - leaf_convert_ms).max(0.0);
-                    log_timing("Leaf hash readback", leaf_readback_ms);
-                    log_timing("Leaf canonical decode", leaf_convert_ms);
+                    log_timing_verbose("Leaf hash readback", leaf_readback_ms);
+                    log_timing_verbose("Leaf canonical decode", leaf_convert_ms);
                     leaf_hashes = hashes;
 
                     // Read node hashes
@@ -1190,8 +1203,8 @@ where
                         .await?;
                         let node_total_ms = now_ms() - node_read_start;
                         let node_readback_ms = (node_total_ms - node_convert_ms).max(0.0);
-                        log_timing("Node hash readback", node_readback_ms);
-                        log_timing("Node canonical decode", node_convert_ms);
+                        log_timing_verbose("Node hash readback", node_readback_ms);
+                        log_timing_verbose("Node canonical decode", node_convert_ms);
                         node_hashes = hashes;
                     }
                 }
@@ -1214,13 +1227,13 @@ where
                 .await?;
                 let cap_total_ms = now_ms() - cap_read_start;
                 let cap_readback_ms = (cap_total_ms - cap_convert_ms).max(0.0);
-                log_timing("Cap readback", cap_readback_ms);
-                log_timing("Cap canonical decode", cap_convert_ms);
+                log_timing_verbose("Cap readback", cap_readback_ms);
+                log_timing_verbose("Cap canonical decode", cap_convert_ms);
 
                 // CPU post-processing: reconstruct digest tree if requested
                 let mut digests = Vec::new();
                 if full_tree_readback {
-                    console::log_1(&"=== PHASE 5: CPU Post-processing ===".into());
+                    log("=== PHASE 5: CPU Post-processing ===");
                     let postprocess_start = now_ms();
 
                     let num_digests = 2 * (num_leaves - (1 << cap_height));
@@ -1251,12 +1264,12 @@ where
                         }
                     }
 
-                    log_timing("Digest tree reconstruction", now_ms() - postprocess_start);
+                    log_timing_verbose("Digest tree reconstruction", now_ms() - postprocess_start);
                 } else {
                     log("Digest reconstruction skipped (cap-only mode)");
                 }
 
-                log_timing(
+                log_timing_verbose(
                     "📥 TOTAL READBACK + POST-PROCESSING",
                     now_ms() - readback_start,
                 );
@@ -1879,7 +1892,7 @@ fn hash_leaves_gpu(
             },
         ],
     });
-    log_timing(
+    log_timing_verbose(
         "  Leaf buffer creation + bind group",
         now_ms() - buffer_start,
     );
@@ -1906,7 +1919,7 @@ fn hash_leaves_gpu(
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
     log_queue_submission("hash_leaves_gpu", submission_index.clone());
-    log_timing("  Leaf dispatch", now_ms() - dispatch_start);
+    log_timing_verbose("  Leaf dispatch", now_ms() - dispatch_start);
 
     Ok((output_buffer, submission_index))
 }
@@ -2094,7 +2107,7 @@ fn transpose_to_mont_gpu(
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
     log_queue_submission("canonical_to_montgomery_gpu", submission_index.clone());
-    log_timing("  Canon->Mont dispatch", now_ms() - dispatch_start);
+    log_timing_verbose("  Canon->Mont dispatch", now_ms() - dispatch_start);
 
     Ok((output_buf, submission_index))
 }
@@ -2138,7 +2151,7 @@ fn montgomery_to_canonical_gpu(
             },
         ],
     });
-    log_timing(
+    log_timing_verbose(
         "  Mont->Canon buffer creation + bind group",
         now_ms() - buffer_start,
     );
@@ -2166,7 +2179,7 @@ fn montgomery_to_canonical_gpu(
 
     let submission_index = ctx.queue.submit(Some(encoder.finish()));
     log_queue_submission("montgomery_to_canonical_gpu", submission_index.clone());
-    log_timing("  Mont->Canon dispatch", now_ms() - dispatch_start);
+    log_timing_verbose("  Mont->Canon dispatch", now_ms() - dispatch_start);
 
     Some(submission_index)
 }
@@ -2289,7 +2302,7 @@ where
     // TODO: After main Merkle tree kernel calls: single Montgomery -> canonical pass for all digsts / nodes
 
     // PHASE 1: Leaf hashing setup and dispatch
-    console::log_1(&"=== PHASE 1: Leaf Hashing ===".into());
+    log("=== PHASE 1: Leaf Hashing ===");
     let leaf_start = now_ms();
     log("launching GPU Poseidon hashing");
     let (leaf_buffer, _submission_index) =
@@ -2298,23 +2311,20 @@ where
         saw_submission = true;
     }
     log("queued GPU Poseidon hashing");
-    log_timing("Leaf hash setup + dispatch", now_ms() - leaf_start);
+    log_timing_verbose("Leaf hash setup + dispatch", now_ms() - leaf_start);
 
     // PHASE 2: Buffer allocation
-    console::log_1(&"=== PHASE 2: Buffer Creation ===".into());
+    log("=== PHASE 2: Buffer Creation ===");
 
     let buffer_start = now_ms();
     let buffers = create_buffers(ctx_ref, leaf_buffer, total_nodes, cap_len);
-    log_timing("Buffer allocation", now_ms() - buffer_start);
+    log_timing_verbose("Buffer allocation", now_ms() - buffer_start);
 
     // PHASE 3: Layer processing
-    console::log_1(
-        &format!(
-            "=== PHASE 3: Layer Processing ({} layers) ===",
-            num_layers_to_cap
-        )
-        .into(),
-    );
+    log(&format!(
+        "=== PHASE 3: Layer Processing ({} layers) ===",
+        num_layers_to_cap
+    ));
     let layer_setup_start = now_ms();
 
     for layer in 0..num_layers_to_cap {
@@ -2429,13 +2439,10 @@ where
         let submit_time = now_ms() - submit_start;
 
         let layer_time = now_ms() - layer_start;
-        console::log_1(
-            &format!(
-                "  Layer {}: total={:.2}ms (bind={:.2}ms, encode={:.2}ms, submit={:.2}ms)",
-                layer, layer_time, bind_time, encode_time, submit_time
-            )
-            .into(),
-        );
+        log(&format!(
+            "  Layer {}: total={:.2}ms (bind={:.2}ms, encode={:.2}ms, submit={:.2}ms)",
+            layer, layer_time, bind_time, encode_time, submit_time
+        ));
     }
 
     // Convert input buffer (leaf nodes) from Montgomery into canonical repr
@@ -2463,7 +2470,7 @@ where
     }
 
     let total_layer_time = now_ms() - layer_setup_start;
-    log_timing("Total layer setup + dispatch", total_layer_time);
+    log_timing_verbose("Total layer setup + dispatch", total_layer_time);
 
     log("queued GPU Merkle buffers");
 
