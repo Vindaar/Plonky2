@@ -2062,8 +2062,8 @@ fn transpose_to_mont_gpu(
     // Time dispatch
     let dispatch_start = now_ms();
 
-    let bx = 32;
-    let by = 32;
+    let bx = 16;
+    let by = 16;
     let workgroups_x = (elems_per_leaf + bx - 1) / bx; // across columns;
     let workgroups_y = (num_leaves + by - 1) / by; // across rows;
 
