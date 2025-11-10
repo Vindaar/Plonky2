@@ -1007,13 +1007,16 @@ where
                         digests.chunks_mut(subtree_digests_len).enumerate()
                     {
                         let leaf_offset = subtree_idx * subtree_leaves_len;
-                        let root_digest = fill_subtree_from_gpu(
+                        write_subtree_chunk_from_gpu(
                             subtree_buf,
                             &accessor,
                             leaf_offset,
                             subtree_leaves_len,
                         );
-                        debug_assert_eq!(root_digest, cap_hashes[subtree_idx]);
+                        debug_assert_eq!(
+                            accessor.node(accessor.cap_layer(), subtree_idx),
+                            &cap_hashes[subtree_idx]
+                        );
                     }
 
                     digests
@@ -1099,7 +1102,6 @@ struct HashSection<'a> {
 }
 
 struct HashSectionResult<F: RichField> {
-    label: &'static str,
     hashes: Vec<HashOut<F>>,
     readback_ms: f64,
     convert_ms: f64,
@@ -1183,7 +1185,6 @@ async fn read_hash_sections<F: RichField>(
         let convert_ms = now_ms() - convert_start;
         let readback_ms = copy_elapsed * (section.word_len as f64) / total_words_f;
         results.push(HashSectionResult {
-            label: section.label,
             hashes,
             readback_ms,
             convert_ms,
@@ -1862,32 +1863,71 @@ where
     ))
 }
 
-fn fill_subtree_from_gpu<F: RichField>(
-    digests_buf: &mut [HashOut<F>],
+struct SubtreeFrame {
+    start: usize,
+    len: usize,
+    leaf_offset: usize,
+    leaves_len: usize,
+    layer_index: usize,
+}
+
+fn write_subtree_chunk_from_gpu<F: RichField>(
+    chunk: &mut [HashOut<F>],
     accessor: &LayerAccessor<'_, F>,
     leaf_offset: usize,
     subtree_leaves_len: usize,
-) -> HashOut<F> {
-    if digests_buf.is_empty() {
+) {
+    if chunk.is_empty() {
         debug_assert_eq!(subtree_leaves_len, 1);
-        return accessor.node(0, leaf_offset).clone();
+        return;
     }
 
-    let (left_buf, right_buf) = digests_buf.split_at_mut(digests_buf.len() / 2);
-    let (left_digest_slot, left_recursive_buf) = left_buf.split_last_mut().unwrap();
-    let (right_digest_slot, right_recursive_buf) = right_buf.split_first_mut().unwrap();
+    let mut stack = vec![SubtreeFrame {
+        start: 0,
+        len: chunk.len(),
+        leaf_offset,
+        leaves_len: subtree_leaves_len,
+        layer_index: accessor.cap_layer(),
+    }];
 
-    let half = subtree_leaves_len / 2;
-    let left_digest = fill_subtree_from_gpu(left_recursive_buf, accessor, leaf_offset, half);
-    let right_digest =
-        fill_subtree_from_gpu(right_recursive_buf, accessor, leaf_offset + half, half);
+    while let Some(frame) = stack.pop() {
+        if frame.leaves_len <= 1 || frame.len == 0 {
+            continue;
+        }
+        debug_assert!(frame.layer_index > 0);
+        debug_assert_eq!(frame.len, 2 * (frame.leaves_len - 1));
 
-    *left_digest_slot = left_digest.clone();
-    *right_digest_slot = right_digest.clone();
+        let half_leaves = frame.leaves_len / 2;
+        let chunk_half = frame.len / 2;
+        let left_slot = frame.start + chunk_half - 1;
+        let right_slot = frame.start + chunk_half;
+        let child_layer = frame.layer_index - 1;
 
-    let layer_index = subtree_leaves_len.trailing_zeros() as usize;
-    let node_index = leaf_offset >> layer_index;
-    accessor.node(layer_index, node_index).clone()
+        let left_node_idx = frame.leaf_offset >> child_layer;
+        let right_leaf_offset = frame.leaf_offset + half_leaves;
+        let right_node_idx = right_leaf_offset >> child_layer;
+
+        chunk[left_slot] = accessor.node(child_layer, left_node_idx).clone();
+        chunk[right_slot] = accessor.node(child_layer, right_node_idx).clone();
+
+        let subtree_len = chunk_half - 1;
+        if subtree_len > 0 {
+            stack.push(SubtreeFrame {
+                start: right_slot + 1,
+                len: subtree_len,
+                leaf_offset: right_leaf_offset,
+                leaves_len: half_leaves,
+                layer_index: child_layer,
+            });
+            stack.push(SubtreeFrame {
+                start: frame.start,
+                len: subtree_len,
+                leaf_offset: frame.leaf_offset,
+                leaves_len: half_leaves,
+                layer_index: child_layer,
+            });
+        }
+    }
 }
 
 struct LayerAccessor<'a, F: RichField> {
@@ -1932,6 +1972,10 @@ impl<'a, F: RichField> LayerAccessor<'a, F> {
             l if l == self.num_layers_to_cap => &self.cap_hashes[node_idx],
             _ => panic!("layer {layer} out of bounds"),
         }
+    }
+
+    fn cap_layer(&self) -> usize {
+        self.num_layers_to_cap
     }
 }
 
