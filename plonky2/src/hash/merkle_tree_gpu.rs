@@ -921,72 +921,55 @@ where
                 wait_for_queue(queue_completion).await?;
                 log_timing("⚡ GPU execution (wait_for_queue)", now_ms() - wait_start);
 
-                // Read leaf hashes
-                let leaf_read_start = now_ms();
-                let (leaf_hashes, leaf_convert_ms) = map_u32_buffer_async(
-                    &context,
-                    &buffers.input,
-                    num_leaves * WORDS_PER_DIGEST,
-                    |words| {
-                        let convert_start = now_ms();
-                        let hashes = words
-                            .chunks(WORDS_PER_DIGEST)
-                            .map(words_to_hash::<F>)
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok((hashes, now_ms() - convert_start))
-                    },
-                )
-                .await?;
-                let leaf_total_ms = now_ms() - leaf_read_start;
-                let leaf_readback_ms = (leaf_total_ms - leaf_convert_ms).max(0.0);
-                log_timing_verbose("Leaf hash readback", leaf_readback_ms);
-                log_timing_verbose("Leaf canonical decode", leaf_convert_ms);
-
-                // Read node hashes (may be empty when cap consumes entire tree)
-                let mut node_hashes: Vec<HashOut<F>> = Vec::new();
+                let mut sections = Vec::with_capacity(3);
+                sections.push(HashSection {
+                    label: "Leaf",
+                    buffer: &buffers.input,
+                    word_len: num_leaves * WORDS_PER_DIGEST,
+                });
                 if total_nodes > 0 {
-                    let node_read_start = now_ms();
-                    let (hashes, node_convert_ms) = map_u32_buffer_async(
-                        &context,
-                        &buffers.nodes,
-                        total_nodes * WORDS_PER_DIGEST,
-                        |words| {
-                            let convert_start = now_ms();
-                            let hashes = words
-                                .chunks(WORDS_PER_DIGEST)
-                                .map(words_to_hash::<F>)
-                                .collect::<Result<Vec<_>>>()?;
-                            Ok((hashes, now_ms() - convert_start))
-                        },
-                    )
-                    .await?;
-                    let node_total_ms = now_ms() - node_read_start;
-                    let node_readback_ms = (node_total_ms - node_convert_ms).max(0.0);
-                    log_timing_verbose("Node hash readback", node_readback_ms);
-                    log_timing_verbose("Node canonical decode", node_convert_ms);
-                    node_hashes = hashes;
+                    sections.push(HashSection {
+                        label: "Node",
+                        buffer: &buffers.nodes,
+                        word_len: total_nodes * WORDS_PER_DIGEST,
+                    });
                 }
+                sections.push(HashSection {
+                    label: "Cap",
+                    buffer: &buffers.cap,
+                    word_len: cap_len * WORDS_PER_DIGEST,
+                });
+                let section_results = read_hash_sections::<F>(&context, &sections).await?;
+                debug_assert_eq!(section_results.len(), sections.len());
+                let mut section_iter = section_results.into_iter();
 
-                // Read cap
-                let cap_read_start = now_ms();
-                let (cap_hashes, cap_convert_ms) = map_u32_buffer_async(
-                    &context,
-                    &buffers.cap,
-                    cap_len * WORDS_PER_DIGEST,
-                    |words| {
-                        let convert_start = now_ms();
-                        let hashes = words
-                            .chunks(WORDS_PER_DIGEST)
-                            .map(words_to_hash::<F>)
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok((hashes, now_ms() - convert_start))
-                    },
-                )
-                .await?;
-                let cap_total_ms = now_ms() - cap_read_start;
-                let cap_readback_ms = (cap_total_ms - cap_convert_ms).max(0.0);
-                log_timing_verbose("Cap readback", cap_readback_ms);
-                log_timing_verbose("Cap canonical decode", cap_convert_ms);
+                let leaf_result = section_iter
+                    .next()
+                    .expect("leaf section missing from combined readback");
+                log_timing_verbose("Leaf hash readback", leaf_result.readback_ms);
+                log_timing_verbose("Leaf canonical decode", leaf_result.convert_ms);
+                let leaf_hashes = leaf_result.hashes;
+
+                let (node_hashes, cap_result) = if total_nodes > 0 {
+                    let node_result = section_iter
+                        .next()
+                        .expect("node section missing from combined readback");
+                    log_timing_verbose("Node hash readback", node_result.readback_ms);
+                    log_timing_verbose("Node canonical decode", node_result.convert_ms);
+                    let cap_result = section_iter
+                        .next()
+                        .expect("cap section missing from combined readback");
+                    (node_result.hashes, cap_result)
+                } else {
+                    let cap_result = section_iter
+                        .next()
+                        .expect("cap section missing from combined readback");
+                    (Vec::new(), cap_result)
+                };
+                debug_assert!(section_iter.next().is_none());
+                log_timing_verbose("Cap readback", cap_result.readback_ms);
+                log_timing_verbose("Cap canonical decode", cap_result.convert_ms);
+                let cap_hashes = cap_result.hashes;
 
                 // CPU post-processing: reconstruct digest tree
                 log("=== PHASE 5: CPU Post-processing ===");
@@ -1095,58 +1078,70 @@ async fn wait_for_queue(queue_completion: Option<QueueCompletion>) -> Result<()>
     }
 }
 
-async fn map_u32_buffer_async<T, F>(
-    context: &MerkleTreeGpuContext,
-    buffer: &wgpu::Buffer,
+struct HashSection<'a> {
+    label: &'static str,
+    buffer: &'a Buffer,
     word_len: usize,
-    process: F,
-) -> Result<T>
-where
-    F: FnOnce(&[u32]) -> Result<T>,
-{
-    let readback_id = READBACK_SEQ.fetch_add(1, Ordering::Relaxed);
-    let label = format!("readback[{readback_id}]");
-    let staging_size = (word_len * core::mem::size_of::<u32>()) as u64;
-    log(&format!(
-        "{label} start -> word_len={word_len}, staging_size={staging_size} bytes, source_buffer_size={} bytes",
-        buffer.size()
-    ));
+}
 
-    // Reuse staging buffer (may be larger than this readback)
-    let staging = context.get_or_make_staging(staging_size);
+struct HashSectionResult<F: RichField> {
+    label: &'static str,
+    hashes: Vec<HashOut<F>>,
+    readback_ms: f64,
+    convert_ms: f64,
+}
+
+async fn read_hash_sections<F: RichField>(
+    context: &MerkleTreeGpuContext,
+    sections: &[HashSection<'_>],
+) -> Result<Vec<HashSectionResult<F>>> {
+    if sections.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total_words: usize = sections.iter().map(|section| section.word_len).sum();
+    let total_bytes: u64 = sections
+        .iter()
+        .map(|section| (section.word_len * std::mem::size_of::<u32>()) as u64)
+        .sum();
+    let staging = context.get_or_make_staging(total_bytes);
 
     context
         .device
         .push_error_scope(wgpu::ErrorFilter::Validation);
 
-    // Encode copy to staging
     let mut encoder = context
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("merkle-readback-encoder"),
+            label: Some("merkle-combined-readback"),
         });
-    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, staging_size);
-    log(&format!(
-        "{label} -> submitting copy_buffer_to_buffer of {staging_size} bytes"
-    ));
+    let mut offsets_words = Vec::with_capacity(sections.len());
+    let mut offset_bytes = 0u64;
+    for section in sections {
+        let size_bytes = (section.word_len * std::mem::size_of::<u32>()) as u64;
+        encoder.copy_buffer_to_buffer(section.buffer, 0, &staging, offset_bytes, size_bytes);
+        offsets_words.push((offset_bytes / std::mem::size_of::<u32>() as u64) as usize);
+        offset_bytes += size_bytes;
+    }
     let submission_index = context.queue.submit(Some(encoder.finish()));
-    log_queue_submission(&format!("{label} copy"), submission_index);
-    log(&format!("{label} copy submitted"));
+    log_queue_submission("combined_readback_copy", submission_index);
 
-    // Only map the region we wrote this iteration
-    let slice = staging.slice(0..staging_size);
-
+    let slice = staging.slice(0..total_bytes);
     let (map_tx, map_rx) = oneshot::channel();
+    let readback_id = READBACK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let label = format!("combined_readback[{readback_id}]");
     log(&format!("{label} map_async registering"));
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = map_tx.send(res);
     });
 
     log(&format!("{label} awaiting map_async completion"));
+    let copy_start = now_ms();
     map_rx
         .await
         .map_err(|_| anyhow!("{label} map_async callback dropped"))?
         .map_err(|err| anyhow!("{label} map_async error: {err:?}"))?;
+    let copy_elapsed = now_ms() - copy_start;
 
     if let Some(err) =
         pop_error_scope(context.device.clone(), format!("{label} validation scope")).await
@@ -1154,32 +1149,37 @@ where
         return Err(anyhow!("validation error during readback: {err:?}"));
     }
 
-    // Read only the bytes we mapped → exactly `word_len` u32s
     let data = slice.get_mapped_range();
     let words_slice: &[u32] = bytemuck::cast_slice::<u8, u32>(&data);
-    debug_assert_eq!(
-        words_slice.len(),
-        word_len,
-        "{label} mapped words != expected word_len"
-    );
-    let process_result = process(words_slice);
+    let total_words_f = (total_words.max(1)) as f64;
+    let mut results = Vec::with_capacity(sections.len());
+    for (idx, section) in sections.iter().enumerate() {
+        let start = offsets_words[idx];
+        let end = start + section.word_len;
+        debug_assert!(
+            end <= words_slice.len(),
+            "{label} mapped words shorter than expected for {} section",
+            section.label
+        );
+        let convert_start = now_ms();
+        let hashes = words_slice[start..end]
+            .chunks(WORDS_PER_DIGEST)
+            .map(words_to_hash::<F>)
+            .collect::<Result<Vec<_>>>()?;
+        let convert_ms = now_ms() - convert_start;
+        let readback_ms = copy_elapsed * (section.word_len as f64) / total_words_f;
+        results.push(HashSectionResult {
+            label: section.label,
+            hashes,
+            readback_ms,
+            convert_ms,
+        });
+    }
     drop(data);
     staging.unmap();
+    yield_to_event_loop().await;
 
-    match process_result {
-        Ok(value) => {
-            // 🔸 Yield here: give the event loop a turn before the next readback starts
-            yield_to_event_loop().await;
-
-            log(&format!("{label} completed successfully"));
-            Ok(value)
-        }
-        Err(err) => {
-            yield_to_event_loop().await;
-            log(&format!("{label} processor failed: {err:?}"));
-            Err(err)
-        }
-    }
+    Ok(results)
 }
 
 fn send_chunk_data<F: RichField>(ctx: &MerkleTreeGpuContext, leaves: &[Vec<F>]) -> Buffer {
