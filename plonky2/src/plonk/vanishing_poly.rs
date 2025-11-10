@@ -697,15 +697,17 @@ pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const 
     vars_batch: EvaluationVarsBaseBatch<F>,
 ) -> Vec<F> {
     let mut constraints_batch = vec![F::ZERO; common_data.num_gate_constraints * vars_batch.len()];
+    let mut gate_constraints_batch = Vec::new();
     for (i, gate) in common_data.gates.iter().enumerate() {
         let selector_index = common_data.selectors_info.selector_indices[i];
-        let gate_constraints_batch = gate.0.eval_filtered_base_batch(
+        gate.0.eval_filtered_base_batch(
             vars_batch,
             i,
             selector_index,
             common_data.selectors_info.groups[selector_index].clone(),
             common_data.selectors_info.num_selectors(),
             common_data.num_lookup_selectors,
+            &mut gate_constraints_batch,
         );
         debug_assert!(
             gate_constraints_batch.len() <= constraints_batch.len(),

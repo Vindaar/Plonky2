@@ -16,17 +16,29 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
         yield_constr: StridedConstraintConsumer<P>,
     );
 
-    /// Evaluates entire batch of points. Returns a matrix of constraints. Constraint `j` for point
-    /// `i` is at `index j * batch_size + i`.
-    fn eval_unfiltered_base_batch_packed(&self, vars_batch: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        let mut res = vec![F::ZERO; vars_batch.len() * self.num_constraints()];
+    /// Evaluates entire batch of points, writing into `out`. Constraint `j` for point `i` is at
+    /// `index j * batch_size + i`.
+    #[inline(never)]
+    fn eval_unfiltered_base_batch_packed(
+        &self,
+        vars_batch: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
+        let n_points = vars_batch.len();
+        let n_cons = self.num_constraints();
+        let len = n_points * n_cons;
+
+        out.clear();
+        out.resize(len, F::ZERO);
+
+        //let mut res = vec![F::ZERO; vars_batch.len() * self.num_constraints()];
         let (vars_packed_iter, vars_leftovers_iter) = vars_batch.pack::<<F as Packable>::Packing>();
         let leftovers_start = vars_batch.len() - vars_leftovers_iter.len();
         for (i, vars_packed) in vars_packed_iter.enumerate() {
             self.eval_unfiltered_base_packed(
                 vars_packed,
                 StridedConstraintConsumer::new(
-                    &mut res[..],
+                    &mut out[..],
                     vars_batch.len(),
                     <F as Packable>::Packing::WIDTH * i,
                 ),
@@ -35,9 +47,8 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
         for (i, vars_leftovers) in vars_leftovers_iter.enumerate() {
             self.eval_unfiltered_base_packed(
                 vars_leftovers,
-                StridedConstraintConsumer::new(&mut res[..], vars_batch.len(), leftovers_start + i),
+                StridedConstraintConsumer::new(&mut out[..], vars_batch.len(), leftovers_start + i),
             );
         }
-        res
     }
 }

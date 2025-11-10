@@ -71,8 +71,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ConstantGate {
         panic!("use eval_unfiltered_base_packed instead");
     }
 
-    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+    fn eval_unfiltered_base_batch(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
+        self.eval_unfiltered_base_batch_packed(vars_base, out)
     }
 
     fn eval_unfiltered_circuit(

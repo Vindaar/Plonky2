@@ -10,7 +10,6 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 use serde::{Serialize, Serializer};
 
-use crate::field::batch_util::batch_multiply_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::gates::selectors::UNUSED_SELECTOR;
@@ -108,15 +107,20 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         })
     }
 
-    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        let mut res = vec![F::ZERO; vars_base.len() * self.num_constraints()];
+    fn eval_unfiltered_base_batch(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
+        let len = vars_base.len() * self.num_constraints();
+        out.clear();
+        out.resize(len, F::ZERO);
         for (i, vars_base_one) in vars_base.iter().enumerate() {
             self.eval_unfiltered_base_one(
                 vars_base_one,
-                StridedConstraintConsumer::new(&mut res, vars_base.len(), i),
+                StridedConstraintConsumer::new(out, vars_base.len(), i),
             );
         }
-        res
     }
 
     /// Defines the recursive constraints that enforce the statement represented by this custom gate.
@@ -154,34 +158,40 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             .collect()
     }
 
-    /// The result is an array of length `vars_batch.len() * self.num_constraints()`. Constraint `j`
-    /// for point `i` is at index `j * batch_size + i`.
+    /// The result is stored in `out`, with constraint `j` for point `i` at `j * batch_size + i`.
     fn eval_filtered_base_batch(
         &self,
-        mut vars_batch: EvaluationVarsBaseBatch<F>,
+        vars_batch: EvaluationVarsBaseBatch<F>,
         row: usize,
         selector_index: usize,
         group_range: Range<usize>,
         num_selectors: usize,
         num_lookup_selectors: usize,
-    ) -> Vec<F> {
-        let filters: Vec<_> = vars_batch
-            .iter()
-            .map(|vars| {
-                compute_filter(
-                    row,
-                    group_range.clone(),
-                    vars.local_constants[selector_index],
-                    num_selectors > 1,
-                )
-            })
-            .collect();
-        vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        let mut res_batch = self.eval_unfiltered_base_batch(vars_batch);
-        for res_chunk in res_batch.chunks_exact_mut(filters.len()) {
-            batch_multiply_inplace(res_chunk, &filters);
+        out: &mut Vec<F>,
+    ) {
+        let batch_size = vars_batch.len();
+        let filter_vars = vars_batch;
+        let mut eval_vars = vars_batch;
+        eval_vars.remove_prefix(num_selectors + num_lookup_selectors);
+        self.eval_unfiltered_base_batch(eval_vars, out);
+        if out.is_empty() {
+            return;
         }
-        res_batch
+
+        for (i, vars) in filter_vars.iter().enumerate() {
+            let filter = compute_filter(
+                row,
+                group_range.clone(),
+                vars.local_constants[selector_index],
+                num_selectors > 1,
+            );
+
+            let mut idx = i;
+            while idx < out.len() {
+                out[idx] *= filter;
+                idx += batch_size;
+            }
+        }
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.

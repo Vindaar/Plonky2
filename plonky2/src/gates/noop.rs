@@ -36,8 +36,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for NoopGate {
         Vec::new()
     }
 
-    fn eval_unfiltered_base_batch(&self, _vars: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        Vec::new()
+    fn eval_unfiltered_base_batch(
+        &self,
+        _vars: EvaluationVarsBaseBatch<F>,
+        out: &mut Vec<F>,
+    ) {
+        out.clear();
     }
 
     fn eval_unfiltered_circuit(

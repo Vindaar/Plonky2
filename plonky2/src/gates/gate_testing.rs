@@ -116,7 +116,8 @@ pub fn test_eval_fns<
         public_inputs_hash: &public_inputs_hash,
     };
 
-    let evals_base = gate.eval_unfiltered_base_batch(vars_base_batch);
+    let mut evals_base = Vec::new();
+    gate.eval_unfiltered_base_batch(vars_base_batch, &mut evals_base);
     let evals = gate.eval_unfiltered(vars);
     // This works because we have a batch of 1.
     ensure!(

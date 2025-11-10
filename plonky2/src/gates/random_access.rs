@@ -195,8 +195,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         panic!("use eval_unfiltered_base_packed instead");
     }
 
-    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
-        self.eval_unfiltered_base_batch_packed(vars_base)
+    #[inline(never)]
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>, out: &mut Vec<F>) {
+        self.eval_unfiltered_base_batch_packed(vars_base, out)
     }
 
     fn eval_unfiltered_circuit(
@@ -303,42 +304,53 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
         vars: EvaluationVarsBasePacked<P>,
         mut yield_constr: StridedConstraintConsumer<P>,
     ) {
+        let mut bit_values = vec![P::ZEROS; self.bits];
+
         for copy in 0..self.num_copies {
             let access_index = vars.local_wires[self.wire_access_index(copy)];
-            let mut list_items = (0..self.vec_size())
-                .map(|i| vars.local_wires[self.wire_list_item(i, copy)])
-                .collect::<Vec<_>>();
             let claimed_element = vars.local_wires[self.wire_claimed_element(copy)];
-            let bits = (0..self.bits)
-                .map(|i| vars.local_wires[self.wire_bit(i, copy)])
-                .collect::<Vec<_>>();
 
-            // Assert that each bit wire value is indeed boolean.
-            for &b in &bits {
-                yield_constr.one(b * (b - F::ONE));
+            for i in 0..self.bits {
+                let bit = vars.local_wires[self.wire_bit(i, copy)];
+                yield_constr.one(bit * (bit - F::ONE));
+                bit_values[i] = bit;
             }
 
-            // Assert that the binary decomposition was correct.
-            let reconstructed_index = bits.iter().rev().fold(P::ZEROS, |acc, &b| acc + acc + b);
+            let reconstructed_index = bit_values
+                .iter()
+                .rev()
+                .fold(P::ZEROS, |acc, &b| acc + acc + b);
             yield_constr.one(reconstructed_index - access_index);
 
-            // Repeatedly fold the list, selecting the left or right item from each pair based on
-            // the corresponding bit.
-            for b in bits {
-                list_items = list_items
-                    .iter()
-                    .tuples()
-                    .map(|(&x, &y)| x + b * (y - x))
-                    .collect()
-            }
-
-            debug_assert_eq!(list_items.len(), 1);
-            yield_constr.one(list_items[0] - claimed_element);
+            let selected = self.select_value_packed(&vars, copy, self.bits, 0, &bit_values);
+            yield_constr.one(selected - claimed_element);
         }
         yield_constr.many(
             (0..self.num_extra_constants)
                 .map(|i| vars.local_constants[i] - vars.local_wires[self.wire_extra_constant(i)]),
         );
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> RandomAccessGate<F, D> {
+    fn select_value_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: &EvaluationVarsBasePacked<P>,
+        copy: usize,
+        depth: usize,
+        start: usize,
+        bits: &[P],
+    ) -> P {
+        if depth == 0 {
+            return vars.local_wires[self.wire_list_item(start, copy)];
+        }
+        debug_assert!(depth <= self.bits);
+        let segment_len = self.vec_size() >> (self.bits - depth);
+        let half = segment_len >> 1;
+        let left = self.select_value_packed(vars, copy, depth - 1, start, bits);
+        let right = self.select_value_packed(vars, copy, depth - 1, start + half, bits);
+        let bit = bits[depth - 1];
+        left + bit * (right - left)
     }
 }
 
