@@ -34,7 +34,6 @@ gpu_merkle = [
 ]
 gpu_merkle_verbose_time_logging = ["gpu_merkle"]
 gpu_merkle_logging = ["gpu_merkle", "gpu_merkle_verbose_time_logging"]
-gpu_merkle_full_readback = []
 
 [dependencies]
 ahash = { workspace = true }
