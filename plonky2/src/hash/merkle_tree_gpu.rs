@@ -1927,12 +1927,10 @@ where
     let context = match context {
         Some(ctx) => ctx,
         None => {
-            log::info!("no cnotext!");
             return None;
         }
     };
 
-    log::info!("not really here");
     Some(build_merkle_tree::<F>(context, leaves, cap_height))
 }
 
