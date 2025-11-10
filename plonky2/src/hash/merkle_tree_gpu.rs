@@ -203,9 +203,23 @@ fn log(msg: &str) {
     }
 }
 
+fn log_lazy<F>(builder: F)
+where
+    F: FnOnce() -> String,
+{
+    #[cfg(feature = "gpu_merkle_logging")]
+    {
+        log(&builder());
+    }
+
+    #[cfg(not(feature = "gpu_merkle_logging"))]
+    {
+        let _ = builder;
+    }
+}
+
 fn log_queue_submission(label: &str, index: SubmissionIndex) {
-    let message = format!("📤 Queue submit -> {label} (submission_index={index:?})");
-    log(&message);
+    log_lazy(|| format!("📤 Queue submit -> {label} (submission_index={index:?})"));
 }
 
 /// Monotonic identifier used to correlate instrumentation logs.
@@ -278,9 +292,9 @@ async fn yield_to_event_loop() {
 async fn pop_error_scope(device: Rc<Device>, label: String) -> Option<wgpu::Error> {
     let result = device.pop_error_scope().await;
     if let Some(ref err) = result {
-        log(&format!("{label} -> error: {err:?}"));
+        log_lazy(|| format!("{label} -> error: {err:?}"));
     } else {
-        log(&format!("{label} -> no error"));
+        log_lazy(|| format!("{label} -> no error"));
     }
     result
 }
@@ -1130,12 +1144,12 @@ async fn read_hash_sections<F: RichField>(
     let (map_tx, map_rx) = oneshot::channel();
     let readback_id = READBACK_SEQ.fetch_add(1, Ordering::Relaxed);
     let label = format!("combined_readback[{readback_id}]");
-    log(&format!("{label} map_async registering"));
+    log_lazy(|| format!("{label} map_async registering"));
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = map_tx.send(res);
     });
 
-    log(&format!("{label} awaiting map_async completion"));
+    log_lazy(|| format!("{label} awaiting map_async completion"));
     let copy_start = now_ms();
     map_rx
         .await
@@ -1660,7 +1674,7 @@ where
     log_timing_verbose("Buffer allocation", now_ms() - buffer_start);
 
     // PHASE 3: Layer processing
-    log(&format!(
+    log_lazy(|| format!(
         "=== PHASE 3: Layer Processing ({} layers) ===",
         num_layers_to_cap
     ));
@@ -1669,7 +1683,7 @@ where
     for layer in 0..num_layers_to_cap {
         let layer_start = now_ms();
 
-        log(&format!("layer: {}", layer));
+        log_lazy(|| format!("layer: {}", layer));
         let src_layer_size = host_layer_size(num_leaves, layer);
         let dst_layer_size = host_layer_size(num_leaves, layer + 1);
         let src_offset = if layer == 0 {
@@ -1683,10 +1697,11 @@ where
             0
         };
         let write_to_cap = (layer + 1) == num_layers_to_cap;
-        let layer_sizes_msg = format!(
-            "  layer sizes -> layer: {layer}, src_layer_size: {src_layer_size}, dst_layer_size: {dst_layer_size}, src_offset: {src_offset}, dst_offset: {dst_offset}, write_to_cap: {write_to_cap}"
-        );
-        log(&layer_sizes_msg);
+        log_lazy(|| {
+            format!(
+                "  layer sizes -> layer: {layer}, src_layer_size: {src_layer_size}, dst_layer_size: {dst_layer_size}, src_offset: {src_offset}, dst_offset: {dst_offset}, write_to_cap: {write_to_cap}"
+            )
+        });
 
         let args = MerkleTreeKernelArgs {
             cap_len: cap_len as u32,
@@ -1771,17 +1786,23 @@ where
         // Time submission (should be fast)
         let submit_start = now_ms();
         let submission_index = ctx_ref.queue.submit(Some(encoder.finish()));
-        log_queue_submission(&format!("merkle_layer_{layer}"), submission_index.clone());
+        log_lazy(|| {
+            format!(
+                "📤 Queue submit -> merkle_layer_{layer} (submission_index={submission_index:?})"
+            )
+        });
         if !saw_submission {
             saw_submission = true;
         }
         let submit_time = now_ms() - submit_start;
 
         let layer_time = now_ms() - layer_start;
-        log(&format!(
-            "  Layer {}: total={:.2}ms (bind={:.2}ms, encode={:.2}ms, submit={:.2}ms)",
-            layer, layer_time, bind_time, encode_time, submit_time
-        ));
+        log_lazy(|| {
+            format!(
+                "  Layer {}: total={:.2}ms (bind={:.2}ms, encode={:.2}ms, submit={:.2}ms)",
+                layer, layer_time, bind_time, encode_time, submit_time
+            )
+        });
     }
 
     // Convert input buffer (leaf nodes) from Montgomery into canonical repr
