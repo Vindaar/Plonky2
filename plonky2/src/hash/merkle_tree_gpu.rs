@@ -9,19 +9,14 @@
 #![cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
 
 use std::cell::RefCell;
-use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{anyhow, ensure, Result};
 use bytemuck::{Pod, Zeroable};
 use futures::channel::oneshot;
-use futures::future::{poll_fn, FutureExt};
-use futures::pin_mut;
-use gloo_timers::callback::Timeout;
 use once_cell::unsync::OnceCell;
 use web_sys::console;
 use wgpu::util::DeviceExt;
@@ -32,7 +27,6 @@ use crate::hash::poseidon::{self, Poseidon, SPONGE_WIDTH};
 // Goldilocks modulus and Montgomery parameters.
 const GOLDILOCKS_MODULUS: u64 = 0xFFFF_FFFF_0000_0001;
 const MONTGOMERY_R: u128 = 1u128 << 64;
-const MONTGOMERY_R_INV: u64 = 0xFFFF_FFFE_0000_0001;
 
 const BIGINT_LIMBS: usize = 2;
 const DIGEST_ELEMENTS: usize = NUM_HASH_OUT_ELTS;
@@ -41,12 +35,11 @@ const BYTES_PER_DIGEST: usize = WORDS_PER_DIGEST * std::mem::size_of::<u32>();
 const BYTES_PER_BIGINT: usize = BIGINT_LIMBS * std::mem::size_of::<u32>();
 const POSEIDON_WIDTH: usize = SPONGE_WIDTH;
 const ROUND_CONSTANT_COUNT: usize = POSEIDON_WIDTH * poseidon::N_ROUNDS;
-const WORKGROUP_SIZE: u32 = 64;
 
 // for `now` for timing
 use js_sys::Promise;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::JsFuture;
 
 thread_local! {
     /// WebGPU context reused across Merkle tree constructions.
@@ -75,7 +68,6 @@ pub struct MerkleTreeGpuContext {
     // Cached staging buffer for readbacks (web: reused to avoid churn)
     pub readback_staging: RefCell<Option<Buffer>>,
     pub readback_capacity: RefCell<u64>,
-    pub readback_busy: RefCell<bool>,
 }
 
 impl MerkleTreeGpuContext {
@@ -122,7 +114,6 @@ impl MerkleTreeGpuContext {
             mds_circ,
             mds_diag,
             round_constants,
-            readback_busy: RefCell::new(false),
         }
     }
 }
@@ -165,12 +156,6 @@ fn to_montgomery_u64(value: u64) -> u64 {
     res as u64
 }
 
-/// Montgomery helper: convert Montgomery encoded Goldilocks element back to canonical form.
-fn from_montgomery_u64(value: u64) -> u64 {
-    let res = ((value as u128) * (MONTGOMERY_R_INV as u128)) % (GOLDILOCKS_MODULUS as u128);
-    res as u64
-}
-
 fn field_to_montgomery_words<F: RichField>(value: &F) -> [u32; BIGINT_LIMBS] {
     let canonical = value.to_canonical_u64();
     let monty = to_montgomery_u64(canonical);
@@ -203,6 +188,9 @@ fn words_to_hash<F: RichField>(words: &[u32]) -> Result<HashOut<F>> {
 }
 
 fn log(msg: &str) {
+    #[cfg(not(feature = "gpu_merkle_logging"))]
+    let _ = msg;
+
     #[cfg(target_arch = "wasm32")]
     {
         #[cfg(feature = "gpu_merkle_logging")]
@@ -220,163 +208,8 @@ fn log_queue_submission(label: &str, index: SubmissionIndex) {
     log(&message);
 }
 
-fn full_tree_readback_enabled() -> bool {
-    cfg!(debug_assertions) || cfg!(feature = "gpu_merkle_full_readback")
-}
-
-/// Tracks in-flight readbacks to catch staging buffer leaks between Merkle trees.
-static ACTIVE_READBACKS: AtomicU32 = AtomicU32::new(0);
-/// Counts mapped slices to guarantee every `map_async` is balanced with an `unmap`.
-static ACTIVE_MAPPED_SLICES: AtomicU32 = AtomicU32::new(0);
 /// Monotonic identifier used to correlate instrumentation logs.
 static READBACK_SEQ: AtomicU32 = AtomicU32::new(1);
-
-struct ReadbackGuard {
-    label: String,
-    size_bytes: u64,
-    active: bool,
-}
-
-impl ReadbackGuard {
-    fn new(label: String, size_bytes: u64) -> Self {
-        let previous = ACTIVE_READBACKS.fetch_add(1, Ordering::SeqCst);
-        if previous != 0 {
-            log(&format!(
-                "⚠️ {label} starting while {previous} other readback(s) remain active"
-            ));
-        }
-        debug_assert!(
-            previous == 0,
-            "{label} expected no overlapping readbacks (active before start = {previous})"
-        );
-        log(&format!(
-            "{label} begin -> staging_size={} bytes (active_readbacks={})",
-            size_bytes,
-            previous + 1
-        ));
-
-        Self {
-            label,
-            size_bytes,
-            active: true,
-        }
-    }
-
-    fn release(&mut self, reason: &str) {
-        if !self.active {
-            return;
-        }
-
-        let previous = ACTIVE_READBACKS.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(
-            previous > 0,
-            "{} underflow while releasing readback guard",
-            self.label
-        );
-        log(&format!(
-            "{} end ({reason}) -> staging_size={} bytes (active_readbacks={})",
-            self.label,
-            self.size_bytes,
-            previous - 1
-        ));
-        self.active = false;
-    }
-}
-
-impl Drop for ReadbackGuard {
-    fn drop(&mut self) {
-        self.release("drop");
-    }
-}
-
-struct MappedSliceGuard {
-    label: String,
-    active: bool,
-}
-
-impl MappedSliceGuard {
-    fn new(label: String) -> Self {
-        let previous = ACTIVE_MAPPED_SLICES.fetch_add(1, Ordering::SeqCst);
-        log(&format!(
-            "{label} map_guard begin (active_mapped_slices={})",
-            previous + 1
-        ));
-        Self {
-            label,
-            active: true,
-        }
-    }
-
-    fn release(&mut self, reason: &str) {
-        if !self.active {
-            return;
-        }
-
-        let previous = ACTIVE_MAPPED_SLICES.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(
-            previous > 0,
-            "{} underflow while releasing mapped slice guard",
-            self.label
-        );
-        log(&format!(
-            "{} map_guard end ({reason}) -> active_mapped_slices={}",
-            self.label,
-            previous - 1
-        ));
-        self.active = false;
-    }
-}
-
-impl Drop for MappedSliceGuard {
-    fn drop(&mut self) {
-        self.release("drop");
-    }
-}
-
-struct BusyFlagGuard<'a> {
-    flag: &'a RefCell<bool>,
-}
-
-impl<'a> BusyFlagGuard<'a> {
-    fn new(flag: &'a RefCell<bool>) -> Self {
-        Self { flag }
-    }
-}
-
-impl Drop for BusyFlagGuard<'_> {
-    fn drop(&mut self) {
-        *self.flag.borrow_mut() = false;
-    }
-}
-
-fn scrub_readback_state(ctx: &MerkleTreeGpuContext) {
-    let outstanding_maps = ACTIVE_MAPPED_SLICES.load(Ordering::SeqCst);
-    debug_assert_eq!(outstanding_maps, 0, "entered with a mapped slice");
-    if outstanding_maps != 0 {
-        log(&format!(
-            "⚠️ GPU Merkle entry detected {outstanding_maps} mapped slice(s) still active; resetting counter"
-        ));
-        ACTIVE_MAPPED_SLICES.store(0, Ordering::SeqCst);
-    }
-
-    let outstanding_readbacks = ACTIVE_READBACKS.load(Ordering::SeqCst);
-    if outstanding_readbacks != 0 {
-        log(&format!(
-            "⚠️ GPU Merkle entry detected {outstanding_readbacks} readback guard(s) still active; resetting counter"
-        ));
-        ACTIVE_READBACKS.store(0, Ordering::SeqCst);
-    }
-
-    let was_busy = {
-        let busy_ref = ctx.readback_busy.borrow();
-        *busy_ref
-    };
-    debug_assert!(!was_busy, "entered with readback_busy=true");
-    if was_busy {
-        log("⚠️ GPU Merkle entry clearing stale readback_busy flag");
-        *ctx.readback_busy.borrow_mut() = false;
-    }
-}
 
 // ============================================================================
 // PROFILING HELPERS
@@ -418,6 +251,12 @@ fn log_timing(label: &str, duration_ms: f64) {
 
 /// Log timing information to console
 fn log_timing_verbose(label: &str, duration_ms: f64) {
+    #[cfg(not(feature = "gpu_merkle_verbose_time_logging"))]
+    {
+        let _ = label;
+        let _ = duration_ms;
+    }
+
     #[cfg(target_arch = "wasm32")]
     {
         #[cfg(feature = "gpu_merkle_verbose_time_logging")]
@@ -435,42 +274,15 @@ async fn yield_to_event_loop() {
     let _ = JsFuture::from(promise).await;
 }
 
-/// Helper that pops a previously-pushed error scope, polling the device until the
-/// result is ready so we can surface validation/OOM diagnostics even on wasm.
-async fn pop_error_scope_with_poll(device: Rc<Device>, label: String) -> Option<wgpu::Error> {
-    let log_prefix = label.clone();
-    let (sender, receiver) = oneshot::channel();
-    let pop_future = device.pop_error_scope();
-    spawn_local(async move {
-        let result = pop_future.await;
-        if let Some(ref err) = result {
-            log(&format!("{log_prefix} -> error: {err:?}"));
-        } else {
-            log(&format!("{log_prefix} -> no error"));
-        }
-        let _ = sender.send(result);
-    });
-
-    let mut receiver = receiver;
-    poll_fn(|cx| match receiver.poll_unpin(cx) {
-        std::task::Poll::Ready(res) => {
-            return std::task::Poll::Ready(res.unwrap_or(None));
-        }
-        std::task::Poll::Pending => {
-            if let Err(err) = device.poll(wgpu::PollType::Poll) {
-                log(&format!(
-                    "{label} -> device.poll returned error while awaiting pop: {err:?}"
-                ));
-            }
-            let waker = cx.waker().clone();
-            spawn_local(async move {
-                yield_to_event_loop().await;
-                waker.wake();
-            });
-            std::task::Poll::Pending
-        }
-    })
-    .await
+/// Helper that pops a previously-pushed error scope.
+async fn pop_error_scope(device: Rc<Device>, label: String) -> Option<wgpu::Error> {
+    let result = device.pop_error_scope().await;
+    if let Some(ref err) = result {
+        log(&format!("{label} -> error: {err:?}"));
+    } else {
+        log(&format!("{label} -> no error"));
+    }
+    result
 }
 
 /// Initialize the global WebGPU context. Subsequent calls are no-ops.
@@ -1013,61 +825,30 @@ struct MerkleBuffers {
     cap: Buffer,
 }
 
+#[derive(Debug)]
 struct QueueCompletion {
     receiver: oneshot::Receiver<()>,
-    callback_fired: Arc<AtomicBool>,
-    sender_holder: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl QueueCompletion {
     fn new(queue: Rc<Queue>) -> Self {
         let (sender, receiver) = oneshot::channel();
-        let callback_fired = Arc::new(AtomicBool::new(false));
-        let sender_holder = Arc::new(Mutex::new(Some(sender)));
-        let callback_flag = Arc::clone(&callback_fired);
-        let sender_holder_cb = Arc::clone(&sender_holder);
         queue.on_submitted_work_done(move || {
             log("wait_for_queue -> on_submitted_work_done invoked");
-            callback_flag.store(true, Ordering::SeqCst);
-            if let Ok(mut guard) = sender_holder_cb.lock() {
-                if let Some(tx) = guard.take() {
-                    let _ = tx.send(());
-                }
-            }
+            let _ = sender.send(());
         });
-
-        Self {
-            receiver,
-            callback_fired,
-            sender_holder,
-        }
+        Self { receiver }
     }
 
-    fn split(
-        self,
-    ) -> (
-        oneshot::Receiver<()>,
-        Arc<AtomicBool>,
-        Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    ) {
-        (self.receiver, self.callback_fired, self.sender_holder)
-    }
-}
-
-impl fmt::Debug for QueueCompletion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QueueCompletion")
-            .field(
-                "callback_fired",
-                &self.callback_fired.load(Ordering::Relaxed),
-            )
-            .finish()
+    async fn wait(self) -> Result<()> {
+        self.receiver
+            .await
+            .map_err(|_| anyhow!("queue completion receiver dropped"))
     }
 }
 
 #[derive(Debug)]
-enum MerkleGpuJobState<F: RichField> {
-    Immediate(GpuMerkleOutput<F>),
+enum MerkleGpuJobState {
     Deferred {
         context: Rc<MerkleTreeGpuContext>,
         buffers: MerkleBuffers,
@@ -1082,7 +863,7 @@ enum MerkleGpuJobState<F: RichField> {
 
 #[derive(Debug)]
 pub struct MerkleGpuJob<F: RichField> {
-    state: MerkleGpuJobState<F>,
+    state: MerkleGpuJobState,
     _marker: PhantomData<F>,
 }
 
@@ -1090,13 +871,6 @@ impl<F> MerkleGpuJob<F>
 where
     F: RichField + Poseidon + 'static,
 {
-    fn immediate(output: GpuMerkleOutput<F>) -> Self {
-        Self {
-            state: MerkleGpuJobState::Immediate(output),
-            _marker: PhantomData,
-        }
-    }
-
     fn deferred(
         context: Rc<MerkleTreeGpuContext>,
         buffers: MerkleBuffers,
@@ -1124,7 +898,6 @@ where
 
     async fn finish(self) -> Result<GpuMerkleOutput<F>> {
         match self.state {
-            MerkleGpuJobState::Immediate(output) => Ok(output),
             MerkleGpuJobState::Deferred {
                 context,
                 buffers,
@@ -1145,29 +918,38 @@ where
 
                 // Wait for GPU to finish
                 let wait_start = now_ms();
-                wait_for_queue(
-                    context.device.clone(),
-                    context.queue.clone(),
-                    queue_completion,
-                )
-                .await?;
+                wait_for_queue(queue_completion).await?;
                 log_timing("⚡ GPU execution (wait_for_queue)", now_ms() - wait_start);
 
-                let full_tree_readback = true; // full_tree_readback_enabled();
-                if !full_tree_readback {
-                    log("Full tree readback disabled; skipping leaf/node staging copies (cap-only mode)");
-                }
+                // Read leaf hashes
+                let leaf_read_start = now_ms();
+                let (leaf_hashes, leaf_convert_ms) = map_u32_buffer_async(
+                    &context,
+                    &buffers.input,
+                    num_leaves * WORDS_PER_DIGEST,
+                    |words| {
+                        let convert_start = now_ms();
+                        let hashes = words
+                            .chunks(WORDS_PER_DIGEST)
+                            .map(words_to_hash::<F>)
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok((hashes, now_ms() - convert_start))
+                    },
+                )
+                .await?;
+                let leaf_total_ms = now_ms() - leaf_read_start;
+                let leaf_readback_ms = (leaf_total_ms - leaf_convert_ms).max(0.0);
+                log_timing_verbose("Leaf hash readback", leaf_readback_ms);
+                log_timing_verbose("Leaf canonical decode", leaf_convert_ms);
 
-                let mut leaf_hashes: Vec<HashOut<F>> = Vec::new();
+                // Read node hashes (may be empty when cap consumes entire tree)
                 let mut node_hashes: Vec<HashOut<F>> = Vec::new();
-
-                if full_tree_readback {
-                    // Read leaf hashes
-                    let leaf_read_start = now_ms();
-                    let (hashes, leaf_convert_ms) = map_u32_buffer_async(
+                if total_nodes > 0 {
+                    let node_read_start = now_ms();
+                    let (hashes, node_convert_ms) = map_u32_buffer_async(
                         &context,
-                        &buffers.input,
-                        num_leaves * WORDS_PER_DIGEST,
+                        &buffers.nodes,
+                        total_nodes * WORDS_PER_DIGEST,
                         |words| {
                             let convert_start = now_ms();
                             let hashes = words
@@ -1178,35 +960,11 @@ where
                         },
                     )
                     .await?;
-                    let leaf_total_ms = now_ms() - leaf_read_start;
-                    let leaf_readback_ms = (leaf_total_ms - leaf_convert_ms).max(0.0);
-                    log_timing_verbose("Leaf hash readback", leaf_readback_ms);
-                    log_timing_verbose("Leaf canonical decode", leaf_convert_ms);
-                    leaf_hashes = hashes;
-
-                    // Read node hashes
-                    if total_nodes > 0 {
-                        let node_read_start = now_ms();
-                        let (hashes, node_convert_ms) = map_u32_buffer_async(
-                            &context,
-                            &buffers.nodes,
-                            total_nodes * WORDS_PER_DIGEST,
-                            |words| {
-                                let convert_start = now_ms();
-                                let hashes = words
-                                    .chunks(WORDS_PER_DIGEST)
-                                    .map(words_to_hash::<F>)
-                                    .collect::<Result<Vec<_>>>()?;
-                                Ok((hashes, now_ms() - convert_start))
-                            },
-                        )
-                        .await?;
-                        let node_total_ms = now_ms() - node_read_start;
-                        let node_readback_ms = (node_total_ms - node_convert_ms).max(0.0);
-                        log_timing_verbose("Node hash readback", node_readback_ms);
-                        log_timing_verbose("Node canonical decode", node_convert_ms);
-                        node_hashes = hashes;
-                    }
+                    let node_total_ms = now_ms() - node_read_start;
+                    let node_readback_ms = (node_total_ms - node_convert_ms).max(0.0);
+                    log_timing_verbose("Node hash readback", node_readback_ms);
+                    log_timing_verbose("Node canonical decode", node_convert_ms);
+                    node_hashes = hashes;
                 }
 
                 // Read cap
@@ -1230,44 +988,43 @@ where
                 log_timing_verbose("Cap readback", cap_readback_ms);
                 log_timing_verbose("Cap canonical decode", cap_convert_ms);
 
-                // CPU post-processing: reconstruct digest tree if requested
-                let mut digests = Vec::new();
-                if full_tree_readback {
-                    log("=== PHASE 5: CPU Post-processing ===");
-                    let postprocess_start = now_ms();
+                // CPU post-processing: reconstruct digest tree
+                log("=== PHASE 5: CPU Post-processing ===");
+                let postprocess_start = now_ms();
 
-                    let num_digests = 2 * (num_leaves - (1 << cap_height));
-                    if num_digests > 0 {
-                        digests = vec![HashOut::<F>::ZERO; num_digests];
-                        let accessor = LayerAccessor::new(
-                            &leaf_hashes,
-                            &node_hashes,
-                            &cap_hashes,
-                            num_leaves,
-                            num_layers_to_cap,
+                let num_digests = 2 * (num_leaves - (1 << cap_height));
+                let digests = if num_digests > 0 {
+                    let mut digests = vec![HashOut::<F>::ZERO; num_digests];
+                    let accessor = LayerAccessor::new(
+                        &leaf_hashes,
+                        &node_hashes,
+                        &cap_hashes,
+                        num_leaves,
+                        num_layers_to_cap,
+                    );
+                    let subtree_digests_len = num_digests >> cap_height;
+                    let subtree_leaves_len = num_leaves >> cap_height;
+
+                    log("Subtree business");
+                    for (subtree_idx, subtree_buf) in
+                        digests.chunks_mut(subtree_digests_len).enumerate()
+                    {
+                        let leaf_offset = subtree_idx * subtree_leaves_len;
+                        let root_digest = fill_subtree_from_gpu(
+                            subtree_buf,
+                            &accessor,
+                            leaf_offset,
+                            subtree_leaves_len,
                         );
-                        let subtree_digests_len = num_digests >> cap_height;
-                        let subtree_leaves_len = num_leaves >> cap_height;
-
-                        log("Subtree business");
-                        for (subtree_idx, subtree_buf) in
-                            digests.chunks_mut(subtree_digests_len).enumerate()
-                        {
-                            let leaf_offset = subtree_idx * subtree_leaves_len;
-                            let root_digest = fill_subtree_from_gpu(
-                                subtree_buf,
-                                &accessor,
-                                leaf_offset,
-                                subtree_leaves_len,
-                            );
-                            debug_assert_eq!(root_digest, cap_hashes[subtree_idx]);
-                        }
+                        debug_assert_eq!(root_digest, cap_hashes[subtree_idx]);
                     }
 
-                    log_timing_verbose("Digest tree reconstruction", now_ms() - postprocess_start);
+                    digests
                 } else {
-                    log("Digest reconstruction skipped (cap-only mode)");
-                }
+                    Vec::new()
+                };
+
+                log_timing_verbose("Digest tree reconstruction", now_ms() - postprocess_start);
 
                 log_timing_verbose(
                     "📥 TOTAL READBACK + POST-PROCESSING",
@@ -1323,133 +1080,19 @@ fn create_buffers(
     MerkleBuffers { input, nodes, cap }
 }
 
-async fn wait_for_queue(
-    device: Rc<Device>,
-    _queue: Rc<Queue>,
-    queue_completion: Option<QueueCompletion>,
-) -> Result<()> {
-    if queue_completion.is_some() {
-        log("wait_for_queue -> start (completion callback registered)");
-    } else {
-        log("wait_for_queue -> start (no completion callback; falling back to poll)");
-    }
-
-    let (receiver_opt, callback_flag_opt, sender_holder_opt) = match queue_completion {
+async fn wait_for_queue(queue_completion: Option<QueueCompletion>) -> Result<()> {
+    match queue_completion {
         Some(completion) => {
-            let (receiver, callback_flag, sender_holder) = completion.split();
-            (Some(receiver), Some(callback_flag), Some(sender_holder))
+            log("wait_for_queue -> awaiting queue completion callback");
+            completion.wait().await?;
+            log("wait_for_queue -> completion callback resolved");
+            Ok(())
         }
-        None => (None, None, None),
-    };
-
-    let mut receiver = receiver_opt.map(|rx| rx.fuse());
-    let callback_flag_for_log = callback_flag_opt.as_ref().map(Arc::clone);
-    let callback_flag_poll = callback_flag_opt.as_ref().map(Arc::clone);
-    let sender_holder_poll = sender_holder_opt.as_ref().map(Arc::clone);
-
-    let mut polls: u64 = 0;
-    poll_fn(move |cx| {
-        polls += 1;
-        let poll_result = device.poll(wgpu::PollType::Poll);
-
-        if polls == 1 {
-            log(&format!(
-                "wait_for_queue poll[1]: poll_result={:?}, callback_fired={}",
-                poll_result,
-                callback_flag_poll
-                    .as_ref()
-                    .map(|flag| flag.load(Ordering::Relaxed))
-                    .unwrap_or(false)
-            ));
-        } else if polls % 500 == 0 {
-            log(&format!(
-                "wait_for_queue poll[{polls}]: poll_result={:?}, callback_fired={}",
-                poll_result,
-                callback_flag_poll
-                    .as_ref()
-                    .map(|flag| flag.load(Ordering::Relaxed))
-                    .unwrap_or(false)
-            ));
+        None => {
+            log("wait_for_queue -> skipped (no submissions recorded)");
+            Ok(())
         }
-
-        let mut completed_via_poll = false;
-
-        match poll_result {
-            Ok(status) => {
-                if status.wait_finished() {
-                    if let Some(flag) = callback_flag_poll.as_ref() {
-                        // Callback owns completion; polling keeps the device progressing.
-                        if !flag.load(Ordering::Relaxed) && polls == 1 {
-                            log(&format!(
-                                "wait_for_queue -> poll saw wait_finished (status={status:?}); awaiting callback-driven completion"
-                            ));
-                        }
-                    } else {
-                        completed_via_poll = true;
-                    }
-                }
-            }
-            Err(err) => {
-                log(&format!(
-                    "wait_for_queue -> device.poll reported error: {err:?}"
-                ));
-                if let Some(holder) = sender_holder_poll.as_ref() {
-                    if let Ok(mut guard) = holder.lock() {
-                        if let Some(tx) = guard.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                }
-                return std::task::Poll::Ready(Err(anyhow!("device.poll returned error: {err:?}")));
-            }
-        }
-
-        if completed_via_poll {
-            return std::task::Poll::Ready(Ok(()));
-        }
-
-        if let Some(ref mut rx) = receiver {
-            match rx.poll_unpin(cx) {
-                std::task::Poll::Ready(res) => {
-                    if let Some(flag) = callback_flag_poll.as_ref() {
-                        if !flag.load(Ordering::Relaxed) {
-                            log("wait_for_queue -> receiver ready before callback flag set");
-                        }
-                    }
-                    return std::task::Poll::Ready(
-                        res.map_err(|_| anyhow!("queue completion receiver dropped (oneshot)")),
-                    );
-                }
-                std::task::Poll::Pending => {
-                    if polls % 2000 == 0 {
-                        log("wait_for_queue -> still pending (awaiting callback)");
-                    }
-                }
-            }
-        } else if let Some(flag) = callback_flag_poll.as_ref() {
-            if flag.load(Ordering::Relaxed) {
-                return std::task::Poll::Ready(Ok(()));
-            }
-        }
-
-        if polls == 1 || polls % 64 == 0 {
-            let waker = cx.waker().clone();
-            spawn_local(async move {
-                yield_to_event_loop().await;
-                waker.wake();
-            });
-        }
-        std::task::Poll::Pending
-    })
-    .await?;
-
-    log(&format!(
-        "wait_for_queue -> completed after {polls} polls (callback_fired={})",
-        callback_flag_for_log
-            .map(|flag| flag.load(Ordering::Relaxed))
-            .unwrap_or(false)
-    ));
-    Ok(())
+    }
 }
 
 async fn map_u32_buffer_async<T, F>(
@@ -1461,24 +1104,9 @@ async fn map_u32_buffer_async<T, F>(
 where
     F: FnOnce(&[u32]) -> Result<T>,
 {
-    {
-        let mut busy = context.readback_busy.borrow_mut();
-        if *busy {
-            // If you prefer, return Err(...) instead of panic/log.
-            log("readback requested while previous readback still in-flight");
-            // Early yield so the previous callback can progress.
-            gloo_timers::future::TimeoutFuture::new(0).await;
-            // re-check or bail out:
-            ensure!(!*busy, "concurrent readback detected");
-        }
-        *busy = true;
-    }
-    let busy_guard = BusyFlagGuard::new(&context.readback_busy);
-
     let readback_id = READBACK_SEQ.fetch_add(1, Ordering::Relaxed);
     let label = format!("readback[{readback_id}]");
     let staging_size = (word_len * core::mem::size_of::<u32>()) as u64;
-    let mut readback_guard = ReadbackGuard::new(label.clone(), staging_size);
     log(&format!(
         "{label} start -> word_len={word_len}, staging_size={staging_size} bytes, source_buffer_size={} bytes",
         buffer.size()
@@ -1508,79 +1136,22 @@ where
     // Only map the region we wrote this iteration
     let slice = staging.slice(0..staging_size);
 
-    let mut map_guard = MappedSliceGuard::new(label.clone());
-
-    let (map_tx, map_rx) = futures_channel::oneshot::channel();
+    let (map_tx, map_rx) = oneshot::channel();
     log(&format!("{label} map_async registering"));
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = map_tx.send(res);
     });
 
-    let wait_map = map_rx
-        .map(|res| match res {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(anyhow::anyhow!("map_async error: {e:?}")),
-            Err(_) => Err(anyhow::anyhow!("map_async callback dropped")),
-        })
-        .fuse();
-    let timeout_ms: u32 = 5_000;
-    let (timeout_tx, timeout_rx) = futures_channel::oneshot::channel::<()>();
-    let closure_label = label.clone();
-    let mut timeout_handle = Some(Timeout::new(timeout_ms, move || {
-        log(&format!(
-            "{closure_label} map_async watchdog timer fired (setTimeout)"
-        ));
-        let _ = timeout_tx.send(());
-    }));
-    let timeout_label = label.clone();
-    let timeout_rx = timeout_rx
-        .map(move |res| match res {
-            Ok(()) => Err(anyhow::anyhow!(
-                "{timeout_label} map_async timed out after {timeout_ms}ms"
-            )),
-            Err(_) => Err(anyhow::anyhow!(
-                "{timeout_label} map_async watchdog channel dropped before firing"
-            )),
-        })
-        .fuse();
-
     log(&format!("{label} awaiting map_async completion"));
-    pin_mut!(wait_map, timeout_rx);
-    let map_result: Result<()> = futures::select! {
-        res = wait_map => {
-            if let Some(handle) = timeout_handle.take() {
-                handle.cancel();
-            }
-            log(&format!("{label} map_async completed"));
-            res
-        }
-        timeout_err = timeout_rx => {
-            log(&format!("{label} map_async watchdog fired"));
-            timeout_err
-        }
-    };
-    if let Some(handle) = timeout_handle.take() {
-        handle.cancel();
-    }
+    map_rx
+        .await
+        .map_err(|_| anyhow!("{label} map_async callback dropped"))?
+        .map_err(|err| anyhow!("{label} map_async error: {err:?}"))?;
 
     if let Some(err) =
-        pop_error_scope_with_poll(context.device.clone(), format!("{label} validation scope")).await
+        pop_error_scope(context.device.clone(), format!("{label} validation scope")).await
     {
-        map_guard.release("validation error");
-        readback_guard.release("validation error");
-        drop(busy_guard);
-        return Err(anyhow::anyhow!("validation error during readback: {err:?}"));
-    }
-
-    if let Err(err) = &map_result {
-        log(&format!("{label} map_async failed: {err:?}"));
-    }
-
-    if let Err(err) = map_result {
-        map_guard.release("map_async error");
-        readback_guard.release("map_async error");
-        drop(busy_guard);
-        return Err(err);
+        return Err(anyhow!("validation error during readback: {err:?}"));
     }
 
     // Read only the bytes we mapped → exactly `word_len` u32s
@@ -1597,9 +1168,6 @@ where
 
     match process_result {
         Ok(value) => {
-            map_guard.release("success");
-            readback_guard.release("success");
-            drop(busy_guard);
             // 🔸 Yield here: give the event loop a turn before the next readback starts
             yield_to_event_loop().await;
 
@@ -1607,45 +1175,11 @@ where
             Ok(value)
         }
         Err(err) => {
-            map_guard.release("processor error");
-            readback_guard.release("processor error");
-            drop(busy_guard);
             yield_to_event_loop().await;
             log(&format!("{label} processor failed: {err:?}"));
             Err(err)
         }
     }
-}
-
-fn transpose_leaves_to_words<F: RichField>(leaves: &[Vec<F>]) -> Result<(Vec<u32>, usize)> {
-    let num_leaves = leaves.len();
-    let elements_per_leaf = leaves[0].len();
-
-    let total_fields = num_leaves.checked_mul(elements_per_leaf).ok_or_else(|| {
-        anyhow!(
-            "leaf transposition overflow: {} leaves × {} elements",
-            num_leaves,
-            elements_per_leaf
-        )
-    })?;
-    let total_words = total_fields
-        .checked_mul(BIGINT_LIMBS)
-        .ok_or_else(|| anyhow!("leaf transposition word count overflow: {total_fields} fields"))?;
-
-    let mut words = Vec::new();
-    if let Err(err) = words.try_reserve_exact(total_words) {
-        return Err(anyhow!(
-            "failed to reserve {total_words} words for canonical leaf buffer: {err}"
-        ));
-    }
-
-    for elem_idx in 0..elements_per_leaf {
-        for leaf in leaves {
-            words.extend_from_slice(&field_to_words(&leaf[elem_idx]));
-        }
-    }
-
-    Ok((words, elements_per_leaf))
 }
 
 fn send_chunk_data<F: RichField>(ctx: &MerkleTreeGpuContext, leaves: &[Vec<F>]) -> Buffer {
@@ -1656,7 +1190,7 @@ fn send_chunk_data<F: RichField>(ctx: &MerkleTreeGpuContext, leaves: &[Vec<F>]) 
     const CHUNK_SIZE: usize = 1000;
 
     let size = (num_leaves * elems_per_leaf * 2 * core::mem::size_of::<u32>()) as u64;
-    let mut dst = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+    let dst = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("merkle-send-chunks"),
         size,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -2066,12 +1600,8 @@ where
         ));
     }
 
-    // Optional: verify previous run didn’t leave state dirty
-    scrub_readback_state(ctx_ref);
-
     // Time data conversion
     //let convert_start = now_ms();
-    //let (canonical_words, elements_per_leaf) = transpose_leaves_to_words(leaves)?;
     ensure!(
         elements_per_leaf > 0,
         "GPU Poseidon hashing received empty leaves"
