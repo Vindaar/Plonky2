@@ -19,7 +19,7 @@ use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
-use crate::util::profiling::with_timer;
+use crate::util::profiling::{with_timer, with_timer_async};
 use crate::util::reverse_index_bits_in_place;
 use crate::util::timing::TimingTree;
 
@@ -42,28 +42,34 @@ pub async fn fri_proof_async<
     assert_eq!(lde_polynomial_coeffs.len(), n);
 
     // Commit phase
-    let (trees, final_coeffs) = timed!(
-        timing,
-        "fold codewords in the commitment phase",
-        fri_committed_trees_async::<F, C, D>(
-            lde_polynomial_coeffs,
-            lde_polynomial_values,
-            challenger,
-            fri_params,
+    let (trees, final_coeffs) = with_timer_async("FRI commit phase", || async {
+        timed!(
+            timing,
+            "fold codewords in the commitment phase",
+            fri_committed_trees_async::<F, C, D>(
+                lde_polynomial_coeffs,
+                lde_polynomial_values,
+                challenger,
+                fri_params,
+            )
+            .await
         )
-        .await
-    );
+    })
+    .await;
 
     // PoW phase
-    let pow_witness = timed!(
-        timing,
-        "find proof-of-work witness",
-        fri_proof_of_work::<F, C, D>(challenger, &fri_params.config)
-    );
+    let pow_witness = with_timer("FRI proof-of-work", || {
+        timed!(
+            timing,
+            "find proof-of-work witness",
+            fri_proof_of_work::<F, C, D>(challenger, &fri_params.config)
+        )
+    });
 
     // Query phase
-    let query_round_proofs =
-        fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
+    let query_round_proofs = with_timer("FRI query rounds", || {
+        fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params)
+    });
 
     FriProof {
         commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),

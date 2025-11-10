@@ -23,7 +23,7 @@ use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::timed;
-use crate::util::profiling::with_timer;
+use crate::util::profiling::{with_timer, with_timer_async};
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
@@ -119,8 +119,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
         });
 
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
+        let mut leaves = with_timer("PolynomialBatch::transpose LDEs", || {
+            timed!(timing, "transpose LDEs", transpose(&lde_values))
+        });
+        with_timer("PolynomialBatch::bit-reverse leaves", || {
+            reverse_index_bits_in_place(&mut leaves);
+        });
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
@@ -149,8 +153,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
         });
 
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
+        let mut leaves = with_timer("PolynomialBatch::transpose LDEs", || {
+            timed!(timing, "transpose LDEs", transpose(&lde_values))
+        });
+        with_timer("PolynomialBatch::bit-reverse leaves", || {
+            reverse_index_bits_in_place(&mut leaves);
+        });
 
         #[cfg(all(feature = "gpu_merkle", target_arch = "wasm32"))]
         let merkle_tree = timed!(
@@ -258,40 +266,49 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for FriBatchInfo { point, polynomials } in &instance.batches {
-            // Collect the coefficients of all the polynomials in `polynomials`.
-            let polys_coeff = polynomials.iter().map(|fri_poly| {
-                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
-            });
-            let composition_poly = timed!(
+        with_timer("FRI combine opening batches", || {
+            for FriBatchInfo { point, polynomials } in &instance.batches {
+                // Collect the coefficients of all the polynomials in `polynomials`.
+                let polys_coeff = polynomials.iter().map(|fri_poly| {
+                    &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
+                });
+                let composition_poly = timed!(
+                    timing,
+                    &format!("reduce batch of {} polynomials", polynomials.len()),
+                    alpha.reduce_polys_base(polys_coeff)
+                );
+                let mut quotient = composition_poly.divide_by_linear(*point);
+                quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
+                alpha.shift_poly(&mut final_poly);
+                final_poly += quotient;
+            }
+        });
+
+        let lde_final_poly = with_timer("FRI final polynomial LDE", || {
+            final_poly.lde(fri_params.config.rate_bits)
+        });
+        let lde_final_values = with_timer("FRI final FFT", || {
+            timed!(
                 timing,
-                &format!("reduce batch of {} polynomials", polynomials.len()),
-                alpha.reduce_polys_base(polys_coeff)
-            );
-            let mut quotient = composition_poly.divide_by_linear(*point);
-            quotient.coeffs.push(F::Extension::ZERO); // pad back to power of two
-            alpha.shift_poly(&mut final_poly);
-            final_poly += quotient;
-        }
+                &format!("perform final FFT {}", lde_final_poly.len()),
+                lde_final_poly.coset_fft(F::coset_shift().into())
+            )
+        });
 
-        let lde_final_poly = final_poly.lde(fri_params.config.rate_bits);
-        let lde_final_values = timed!(
-            timing,
-            &format!("perform final FFT {}", lde_final_poly.len()),
-            lde_final_poly.coset_fft(F::coset_shift().into())
-        );
-
-        let fri_proof = fri_proof_async::<F, C, D>(
-            &oracles
-                .par_iter()
-                .map(|c| &c.merkle_tree)
-                .collect::<Vec<_>>(),
-            lde_final_poly,
-            lde_final_values,
-            challenger,
-            fri_params,
-            timing,
-        )
+        let fri_proof = with_timer_async("FRI prove openings", || async {
+            fri_proof_async::<F, C, D>(
+                &oracles
+                    .par_iter()
+                    .map(|c| &c.merkle_tree)
+                    .collect::<Vec<_>>(),
+                lde_final_poly,
+                lde_final_values,
+                challenger,
+                fri_params,
+                timing,
+            )
+            .await
+        })
         .await;
 
         fri_proof
