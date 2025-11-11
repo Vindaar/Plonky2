@@ -13,7 +13,7 @@ categories.workspace = true
 
 [features]
 #default = ["gpu_merkle"]
-default = []
+default = ["wasm_test_exports"]
 # default = ["gate_testing", "parallel", "rand_chacha", "std", "timing"]
 gate_testing = []
 parallel = ["hashbrown/rayon", "plonky2_maybe_rayon/parallel"]
@@ -34,6 +34,7 @@ gpu_merkle = [
 ]
 gpu_merkle_verbose_time_logging = ["gpu_merkle"]
 gpu_merkle_logging = ["gpu_merkle", "gpu_merkle_verbose_time_logging"]
+wasm_test_exports = []
 
 [dependencies]
 ahash = { workspace = true }
