@@ -35,7 +35,7 @@ This directory contains two WASM test implementations:
 
 ## Building
 
-From the `plonky2/plonky2` directory, run:
+From the `Plonky2/plonky2` directory, run:
 
 ```bash
 ./build-wasm.sh
